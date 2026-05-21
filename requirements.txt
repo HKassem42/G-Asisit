@@ -1,3 +1,37 @@
-streamlit
-pandas
-plotly
+# =====================================================================
+# G-Asisit — Python Prototype Dependencies
+# ---------------------------------------------------------------------
+# What:  Streamlit prototype for iterating on the PvP-trading scoring
+#        formula + UX before the React Native + NestJS production build.
+# Why:   Python lets us prove out R / K / C / A / B math fast.
+# How:   pip install -r requirements.txt && streamlit run app.py
+# =====================================================================
+
+# --- Core UI -----------------------------------------------------------
+streamlit>=1.36,<2.0          # Prototype web UI
+streamlit-autorefresh>=1.0    # Live-tick refresh for duel rooms
+
+# --- Data + Math -------------------------------------------------------
+pandas>=2.2                   # Trade ledgers, position math
+numpy>=1.26                   # Vectorized P/L + Sharpe calcs
+plotly>=5.22                  # Equity curves, leaderboards, candlesticks
+
+# --- Market Data (mock + real) ----------------------------------------
+yfinance>=0.2.40              # Free historical prices for backtests
+requests>=2.32                # REST calls (Polygon.io / mock endpoints)
+websocket-client>=1.8         # Polygon.io WS feed when we upgrade
+
+# --- Scoring Engine ----------------------------------------------------
+scipy>=1.13                   # stats for Sharpe / risk-adjusted returns
+scikit-learn>=1.5             # MMR / ELO experiments + clustering
+
+# --- Persistence (prototype only — prod uses Supabase Postgres) -------
+SQLAlchemy>=2.0               # Local SQLite for wallet + trades stub
+psycopg2-binary>=2.9          # If we point the prototype at Supabase
+
+# --- Auth / Env / Config -----------------------------------------------
+python-dotenv>=1.0            # Load API keys from .env
+pydantic>=2.7                 # Typed config + validation
+
+# --- Realtime sandbox (optional) --------------------------------------
+python-socketio>=5.11         # Spike Socket.io client behavior from Py
