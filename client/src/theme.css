@@ -1,0 +1,90 @@
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+  --font-display: "Archivo", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Premium dark finish in both system modes: the product is a dark
+   arena terminal by design — deep charcoal-green surfaces, one lime
+   accent, hairline borders, soft elevation. */
+:root {
+  color-scheme: dark;
+  --bg: #0a0c08;
+  --surface: #14170f;
+  --surface2: #1d2115;
+  --surface3: #262b1b;
+  --text: #f2f4ec;
+  --dim: #9aa08e;
+  --faint: #6d7460;
+  --border: #2a2f1f;
+  --border-strong: #3a4128;
+  --accent: #bff747;
+  --accent-dim: #8fbf2a;
+  --accent-ink: #131603;
+  --teal: #2dd4bf;
+  --gold: #e7c65a;
+  --red: #f87171;
+  --radius: 14px;
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.45), 0 10px 28px -14px rgb(0 0 0 / 0.65);
+  --shadow-pop: 0 2px 6px rgb(0 0 0 / 0.5), 0 18px 40px -16px rgb(0 0 0 / 0.75);
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface2);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+input, select, textarea {
+  font-size: 16px; /* prevent iOS zoom on focus */
+}
+
+/* Elevation helpers for the card system */
+.elev {
+  box-shadow: var(--shadow-card);
+}
+.elev-pop {
+  box-shadow: var(--shadow-pop);
+}
+
+/* Thin, quiet scrollbars inside the phone column */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}

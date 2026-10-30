@@ -1,0 +1,1 @@
+UPDATE `milestones` SET `status_note` = 'Live BTC/USD price via the CoinGecko public API is ready (BTC/USD is the only market in this edition). Store submission is a deploy step, when you say deploy; Polygon.io still needs your own key.' WHERE `week` = 8;
