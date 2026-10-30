@@ -36,6 +36,13 @@
       "when": 1793394779559,
       "tag": "0005_week8_note_btc_only",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793397142745,
+      "tag": "0006_week8_note_coinbase_feed",
+      "breakpoints": true
     }
   ]
 }

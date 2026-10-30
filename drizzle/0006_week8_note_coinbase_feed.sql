@@ -1,0 +1,1 @@
+UPDATE `milestones` SET `status_note` = 'Live BTC/USD price via the free Coinbase public API is ready — no key, no account, no cost (BTC/USD is the only market in this edition). Store submission is a deploy step, when you say deploy; Polygon.io is no longer required.' WHERE `week` = 8;

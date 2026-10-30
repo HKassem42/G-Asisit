@@ -366,7 +366,7 @@ export const Actions = {
         { week: 5, label: "Scoring + End", detail: "Duels auto-end · score calc runs · winner paid", status: "ready", statusNote: "Server-side auto-score and auto-end from your real record (blueprint §6: R·K·C·A·B), pot paid or refunded." },
         { week: 6, label: "Anti-Abuse + Polish", detail: "Cooldowns · device check · min-trades rule", status: "app-scope", statusNote: "Under-3-trades auto-void, 5 duels/hour and 60 trades/hour caps, 24h rematch cooldown — all enforced server-side. Limit: the shared-device check belongs to the shipped app." },
         { week: 7, label: "TestFlight Beta", detail: "EAS submit · 20 friends testing duels", status: "deploy-step", statusNote: "TestFlight beta happens when you say deploy — not built, not faked." },
-        { week: 8, label: "Store Submit", detail: "Screenshots + listing · Polygon.io for real prices", status: "mixed", statusNote: "Live BTC/USD price via the CoinGecko public API is ready (BTC/USD is the only market in this edition). Store submission is a deploy step, when you say deploy; Polygon.io still needs your own key." },
+        { week: 8, label: "Store Submit", detail: "Screenshots + listing · Polygon.io for real prices", status: "mixed", statusNote: "Live BTC/USD price via the free Coinbase public API is ready — no key, no account, no cost (BTC/USD is the only market in this edition). Store submission is a deploy step, when you say deploy; Polygon.io is no longer required." },
       ];
       await db.insert(schema.milestones).values(
         plan.map((p, i) => ({
@@ -484,11 +484,13 @@ export const Actions = {
   }),
 
   // Live quote refresh (Week 8 price feed): pulls the real BTC/USD spot
-  // price from the CoinGecko public API (keyless) and writes it into the
-  // BTC position's current_price. BTC/USD is the only market in this
-  // edition, so only bitcoin is fetched. This is NOT Polygon.io — the
-  // blueprint's named provider still needs Kass's own API key; the UI
-  // labels this source honestly. On any fetch failure nothing changes.
+  // price from the free Coinbase public API (no key, no account, no cost)
+  // and writes it into the BTC position's current_price. BTC/USD is the
+  // only market in this edition, so only the BTC-USD spot pair is
+  // fetched. The blueprint's originally named provider, Polygon.io, is
+  // no longer required — the free Coinbase feed covers the price need.
+  // The UI labels this source honestly. On any fetch failure nothing
+  // changes (the last known price stands).
   refreshPrices: defineAction({
     request: z.object({}),
     response: z.object({
@@ -502,7 +504,7 @@ export const Actions = {
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
       const url =
-        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot";
       let quotes: Record<string, number> = {};
       try {
         const res = await fetch(url, {
@@ -511,21 +513,25 @@ export const Actions = {
         if (!res.ok) {
           return {
             ok: false,
-            message: `Live quote source returned ${res.status} — price left unchanged. You can still update the BTC price by hand.`,
+            message: `Coinbase quote source returned ${res.status} — price left unchanged (last known price stands). You can still update the BTC price by hand.`,
             updated: [],
             asOf: null,
           };
         }
         const json = (await res.json()) as {
-          bitcoin?: { usd?: number };
+          data?: { amount?: string; base?: string; currency?: string };
         };
-        if (typeof json.bitcoin?.usd === "number")
-          quotes.BTC = json.bitcoin.usd;
+        // Coinbase returns the spot amount as a string; only accept it
+        // if it is for the BTC-USD pair and parses to a positive number.
+        if (json.data?.base === "BTC" && json.data?.currency === "USD") {
+          const amount = Number(json.data.amount);
+          if (Number.isFinite(amount) && amount > 0) quotes.BTC = amount;
+        }
       } catch {
         return {
           ok: false,
           message:
-            "Couldn't reach the live quote source — prices left unchanged. You can still update prices by hand.",
+            "Couldn't reach the Coinbase quote source — prices left unchanged (last known price stands). You can still update prices by hand.",
           updated: [],
           asOf: null,
         };
@@ -534,7 +540,7 @@ export const Actions = {
         return {
           ok: false,
           message:
-            "Live quote source sent no usable prices — prices left unchanged.",
+            "Coinbase quote source sent no usable BTC/USD price — price left unchanged (last known price stands).",
           updated: [],
           asOf: null,
         };
@@ -559,7 +565,7 @@ export const Actions = {
         ok: true,
         message:
           updated.length > 0
-            ? `Live prices refreshed from CoinGecko (public quotes — not Polygon.io): ${updated.map((u) => `${u.symbol} $${u.price.toLocaleString("en-US", { maximumFractionDigits: u.price < 1 ? 5 : 2 })}`).join(" · ")}`
+            ? `Live prices refreshed from Coinbase (free public API — no key needed): ${updated.map((u) => `${u.symbol} $${u.price.toLocaleString("en-US", { maximumFractionDigits: u.price < 1 ? 5 : 2 })}`).join(" · ")}`
             : "Live quote fetched, but you hold no BTC position — nothing to update.",
         updated,
         asOf,

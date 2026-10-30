@@ -1541,7 +1541,7 @@ function PortfolioSection({
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-[var(--border)] pt-3">
           <p className="mono min-w-0 flex-1 text-xs text-[var(--dim)]">
-            Live BTC/USD spot from the CoinGecko public API (keyless) — not Polygon.io, which still needs your own API key. Hand entry below still works.
+            Live BTC/USD spot from the free Coinbase public API — no API key, no account, no cost. Hand entry below still works.
           </p>
           <button
             type="button"
@@ -2521,7 +2521,7 @@ function DeployLineSection({
     (m) => m.status === "ready" || m.status === "app-scope",
   ).length;
   const waiting: string[] = [
-    "Polygon.io quotes — the blueprint's named provider needs your own Polygon account + API key; until then the price feed is CoinGecko, labeled as such",
+    "Nothing on prices — live BTC/USD quotes run on the free Coinbase public API (no key, no cost), so the blueprint's paid Polygon.io feed is no longer required",
     "The literal mobile app (Expo) + API (NestJS/Supabase) — separate repos in the blueprint's Next Move, outside this dashboard edition",
     "TestFlight beta (Week 7) and store submission (Week 8) — these ARE the deploy step: developer accounts, EAS submit, store listings",
   ];
@@ -2584,9 +2584,10 @@ function DeployLineSection({
           ))}
         </ul>
         <p className="mono mt-4 rounded-[var(--radius)] bg-[var(--surface2)] px-3 py-2 text-xs">
-          When you're ready: say "deploy" and the next moves are (1) your Polygon.io key for the
-          named price feed, (2) gasisit-api + gasisit-mobile repos per the blueprint, (3)
-          EAS/TestFlight, then store submission — in that order, each verified as it lands.
+          When you're ready: say "deploy" and the next moves are (1) gasisit-api +
+          gasisit-mobile repos per the blueprint, (2) EAS/TestFlight, then store
+          submission — in that order, each verified as it lands. Prices need nothing:
+          the free Coinbase feed is already live.
         </p>
       </div>
     </section>
@@ -2637,9 +2638,9 @@ function BlueprintSection() {
       <p className="mono mt-3 text-xs text-[var(--dim)]">
         Source: G-Asisit Production Blueprint V3 + Streamlit prototype
         (app.py) in your project files. Prices can be refreshed live from
-        the CoinGecko public API (BTC/USD spot — the only market in this edition) or entered by hand;
-        Polygon.io — the blueprint's named provider — still needs a
-        Polygon account/API key. Built to the deploy line and stopping
+        the free Coinbase public API (BTC/USD spot — the only market in this edition; no key,
+        no account, no cost) or entered by hand; the blueprint's named
+        provider, Polygon.io, is no longer required. Built to the deploy line and stopping
         there: no store submission, no deployment, until you say deploy.
         The remaining literal Week 7/8 work (Expo app, EAS/TestFlight,
         store listings) lives in separate mobile/API repos outside this
