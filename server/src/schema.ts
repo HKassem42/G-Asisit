@@ -3,8 +3,8 @@
 // Tables mirror the data model in the project's Production Blueprint (V3)
 // (~/workspace/g-asisit-work/README.md): Wallet + CoinTransaction ledger,
 // Position as the source of truth for P/L, Trade history, Duel records,
-// plus the prototype's ML Signals board, Project-Mine logs, and the
-// 8-week build-order checklist.
+// plus the prototype's ML Signals board and the 8-week build-order
+// checklist. This artifact is the duel game only.
 
 import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
@@ -88,6 +88,10 @@ export const signals = sqliteTable("signals", {
     .$defaultFn(() => new Date()),
 });
 
+// Legacy table from the old prototype snapshot. Project-Mine is a
+// separate project of Kass's and is NOT part of this game: no action
+// reads or writes this table and it is not part of the game's state.
+// The definition stays so the existing stored rows are not destroyed.
 export const miningLogs = sqliteTable("mining_logs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   logDate: text("log_date").notNull(), // user-entered calendar date YYYY-MM-DD (or snapshot label date)

@@ -123,7 +123,6 @@ type IconName =
   | "target"
   | "wallet"
   | "signal"
-  | "pick"
   | "check";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
@@ -219,12 +218,6 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
   signal: (
     <>
       <path d="M4 19.5v-5M9 19.5v-9M14 19.5V7M19 19.5V4" />
-    </>
-  ),
-  pick: (
-    <>
-      <path d="M12.5 3.5c.6 3.8 3.2 6.4 7 7-1 1.8-2.6 2.8-4.6 2.8-3.4 0-6.2-2.8-6.2-6.2 0-2 .9-3 2.2-3.9z" />
-      <path d="m8.7 8.7-4.4 8.4 2.9 2.9L15 14.9" />
     </>
   ),
   check: <path d="m4.5 12.5 5 5 10-11" />,
@@ -567,7 +560,7 @@ export function App() {
                   <p className="font-display font-bold">Start from your Streamlit prototype</p>
                   <p className="mt-1 text-sm text-[var(--dim)]">
                     Import the exact snapshot from app.py — the prototype portfolio (BTC tradable;
-                    ETH / KAS stay as legacy holdings), VisualML signals, the Project-Mine reading,
+                    ETH / KAS stay as legacy holdings), VisualML signals,
                     the 500-coin starter wallet, and the 8-week build plan. Everything stays
                     editable afterward.
                   </p>
@@ -659,7 +652,6 @@ export function App() {
               <LeagueSection wins={duelWins} losses={duelLosses} mmr={data.wallet.mmr} duels={data.duels} />
               <GameCharts
                 positions={data.positions}
-                miningLogs={data.miningLogs}
                 txns={data.walletTxns}
                 wins={duelWins}
                 losses={duelLosses}
@@ -687,7 +679,6 @@ export function App() {
                 </div>
               </section>
               <SignalsSection signals={data.signals} setFeedback={setFeedback} refresh={refresh} />
-              <MiningSection logs={data.miningLogs} setFeedback={setFeedback} refresh={refresh} />
               <ScreensGallery />
               <BuildPlanSection milestones={data.milestones} refresh={refresh} />
               <DeployLineSection milestones={data.milestones} />
@@ -996,16 +987,14 @@ function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartD
 
 // ---------- simple charts ----------
 
-function GameCharts({ positions, miningLogs, txns, wins, losses }: {
+function GameCharts({ positions, txns, wins, losses }: {
   positions: State["positions"];
-  miningLogs: State["miningLogs"];
   txns: State["walletTxns"];
   wins: number;
   losses: number;
 }) {
   const total = positions.reduce((s, p) => s + p.qty * p.current_price, 0);
   const colors = ["var(--accent)", "var(--teal)", "var(--gold)", "#f97316", "#38bdf8", "#94a3b8"];
-  const maxMining = Math.max(...miningLogs.map((l) => l.kas_earned), 1);
   // Coin balance walk from the real ledger, oldest → newest.
   const walk: number[] = [];
   let bal = 0;
@@ -1059,17 +1048,6 @@ function GameCharts({ positions, miningLogs, txns, wins, losses }: {
               <p className="mono text-xs text-[var(--dim)]">From your wallet ledger · now at {walk[walk.length - 1]?.toLocaleString()} coins</p>
             </>
           ) : <p className="mt-2 text-sm text-[var(--dim)]">Your balance line draws itself as wallet transactions happen.</p>}
-          <p className="font-display mt-4 flex items-center gap-2 font-bold"><Icon name="pick" size={17} className="text-[var(--teal)]" /> Mining — KAS per log</p>
-          {miningLogs.length === 0 ? <p className="mt-1 text-sm text-[var(--dim)]">No mining logs yet.</p> : (
-            <div className="mt-2 flex h-24 items-end gap-1.5" role="img" aria-label={`Mining KAS bars: ${miningLogs.slice(0, 10).map((l) => `${l.log_date} ${l.kas_earned} KAS`).join(", ")}`}>
-              {[...miningLogs].slice(0, 10).reverse().map((l) => (
-                <div key={l.id} className="flex min-w-0 flex-1 flex-col items-center gap-1">
-                  <div className="w-full rounded-t bg-[var(--teal)]" style={{ height: `${Math.max((l.kas_earned / maxMining) * 76, 3)}px` }} title={`${l.log_date}: ${l.kas_earned} KAS`} />
-                  <span className="mono text-[10px] text-[var(--dim)]">{l.kas_earned}</span>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       </div>
     </section>
@@ -1183,7 +1161,7 @@ function ScreensGallery() {
           <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-black">Record trade</div>
           <p className="mono mt-2 text-center text-[10px] text-[var(--dim)]">Counts toward your duel score</p>
         </PhoneMock>
-        <PhoneMock title="6 · Portfolio & charts" status="Live — League tab charts: mix bar, balance line, mining bars">
+        <PhoneMock title="6 · Portfolio & charts" status="Live — League tab charts: mix bar, balance line">
           <p className="mono text-[10px]">PORTFOLIO</p>
           <p className="font-display text-base font-extrabold">$50,880</p>
           <div className="mt-2 flex h-3 overflow-hidden rounded-full"><div className="bg-[var(--accent)]" style={{ width: "65%" }} /><div className="bg-[var(--teal)]" style={{ width: "26%" }} /><div style={{ width: "9%", background: "#eab308" }} /></div>
@@ -1219,14 +1197,14 @@ function ScreensGallery() {
           </div>
           <div className="mt-3 rounded-full bg-[var(--surface)] py-1.5 text-center text-xs font-bold">Daily reward · Day 3 streak</div>
         </PhoneMock>
-        <PhoneMock title="10 · Profile & mining" status="Live — the Profile tab: MMR, record, Project-Mine logs">
+        <PhoneMock title="10 · Profile" status="Live — the Profile tab: MMR, record, signals, build plan">
           <div className="flex items-center gap-2"><span className="font-display grid h-9 w-9 place-items-center rounded-full bg-[var(--accent)] text-sm font-extrabold text-black" aria-hidden>K</span><div>{mockLine("70%")}<p className="mono mt-1 text-[10px]">MMR 1000 · 0W–0L</p></div></div>
           <div className="mt-3 grid grid-cols-3 gap-1 text-center">
-            <div className="rounded-lg bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">245</p><p className="text-[9px]">MH/s</p></div>
-            <div className="rounded-lg bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">142</p><p className="text-[9px]">KAS</p></div>
-            <div className="rounded-lg bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">$4.75</p><p className="text-[9px]">today</p></div>
+            <div className="rounded-lg bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">500</p><p className="text-[9px]">coins</p></div>
+            <div className="rounded-lg bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">Lv 1</p><p className="text-[9px]">level</p></div>
+            <div className="rounded-lg bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">BTC</p><p className="text-[9px]">market</p></div>
           </div>
-          <div className="mt-2 flex h-10 items-end gap-1">{[40, 65, 50, 80, 58, 92, 70].map((h, i) => <div key={i} className="flex-1 rounded-t bg-[var(--teal)]" style={{ height: `${h}%` }} />)}</div>
+          <div className="mt-2 space-y-1">{mockLine("85%")}{mockLine("65%")}</div>
         </PhoneMock>
       </div>
     </section>
@@ -2338,203 +2316,6 @@ function SignalsSection({
           disabled={addMut.isPending}
         >
           Add signal
-        </button>
-      </form>
-    </section>
-  );
-}
-
-// ---------- mining (Project-Mine) ----------
-
-function MiningSection({
-  logs,
-  setFeedback,
-  refresh,
-}: {
-  logs: State["miningLogs"];
-  setFeedback: (s: string) => void;
-  refresh: () => void;
-}) {
-  const today = new Date().toISOString().slice(0, 10);
-  const [logDate, setLogDate] = useState(today);
-  const [hashrate, setHashrate] = useState("");
-  const [kas, setKas] = useState("");
-  const [usd, setUsd] = useState("");
-  const [note, setNote] = useState("");
-
-  const addMut = useMutation({
-    mutationFn: () =>
-      api.addMiningLog({
-        logDate,
-        hashrate: Number(hashrate) || 0,
-        kasEarned: Number(kas) || 0,
-        usdValue: Number(usd) || 0,
-        note,
-      }),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      setHashrate("");
-      setKas("");
-      setUsd("");
-      setNote("");
-      refresh();
-    },
-  });
-  const deleteMut = useMutation({
-    mutationFn: (id: number) => api.deleteMiningLog({ id }),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      refresh();
-    },
-  });
-
-  const onAdd = (e: FormEvent) => {
-    e.preventDefault();
-    if (!logDate) {
-      setFeedback("Pick a date for the mining log.");
-      return;
-    }
-    addMut.mutate();
-  };
-
-  const latest = logs[0];
-  const totalKas = logs.reduce((s, l) => s + l.kas_earned, 0);
-  const totalUsd = logs.reduce((s, l) => s + l.usd_value, 0);
-
-  return (
-    <section className="mt-8">
-      <SectionTitle right="Project-Mine">Mining</SectionTitle>
-      <div className="grid grid-cols-3 gap-px overflow-hidden rounded-[var(--radius)] border border-[var(--border)] bg-[var(--border)]">
-        <div className="bg-[var(--surface)] p-4">
-          <p className="text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">
-            Hashrate
-          </p>
-          <p
-            className="mono mt-1 text-2xl font-semibold"
-            style={{ color: "var(--teal)" }}
-          >
-            {latest ? `${latest.hashrate} MH/s` : "—"}
-          </p>
-        </div>
-        <div className="bg-[var(--surface)] p-4">
-          <p className="text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">
-            KAS logged
-          </p>
-          <p className="mono mt-1 text-2xl font-semibold">
-            {totalKas.toLocaleString()}
-          </p>
-        </div>
-        <div className="bg-[var(--surface)] p-4">
-          <p className="text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">
-            Value logged
-          </p>
-          <p className="mono mt-1 text-2xl font-semibold">{fmtUsd(totalUsd)}</p>
-        </div>
-      </div>
-
-      {logs.length > 0 ? (
-        <div className="mt-3 overflow-hidden rounded-[var(--radius)] border border-[var(--border)]">
-          {logs.slice(0, 8).map((l, i) => (
-            <div
-              key={l.id}
-              className={`flex items-baseline justify-between gap-2 bg-[var(--surface)] px-4 py-2.5 ${i > 0 ? "border-t border-[var(--border)]" : ""}`}
-            >
-              <span className="mono text-sm">
-                {l.log_date} · {l.hashrate} MH/s · {l.kas_earned} KAS (
-                {fmtUsd(l.usd_value)})
-                {l.note ? (
-                  <span className="text-[var(--dim)]"> · {l.note}</span>
-                ) : null}
-              </span>
-              <button
-                type="button"
-                aria-label={`Remove mining log for ${l.log_date}`}
-                className="text-[var(--dim)]"
-                onClick={() => deleteMut.mutate(l.id)}
-              >
-                <Icon name="x" size={15} />
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      <form
-        onSubmit={onAdd}
-        className="mt-4 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4"
-      >
-        <p className="font-display font-bold">Log a mining day</p>
-        <div className="mt-3 grid grid-cols-2 gap-3">
-          <div>
-            <label htmlFor="mine-date" className={labelCls}>
-              Date
-            </label>
-            <input
-              id="mine-date"
-              type="date"
-              className={inputCls}
-              value={logDate}
-              onChange={(e) => setLogDate(e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="mine-hash" className={labelCls}>
-              Hashrate MH/s
-            </label>
-            <input
-              id="mine-hash"
-              inputMode="decimal"
-              className={inputCls}
-              placeholder="245"
-              value={hashrate}
-              onChange={(e) => setHashrate(e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="mine-kas" className={labelCls}>
-              KAS earned
-            </label>
-            <input
-              id="mine-kas"
-              inputMode="decimal"
-              className={inputCls}
-              placeholder="142"
-              value={kas}
-              onChange={(e) => setKas(e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="mine-usd" className={labelCls}>
-              Value $
-            </label>
-            <input
-              id="mine-usd"
-              inputMode="decimal"
-              className={inputCls}
-              placeholder="4.75"
-              value={usd}
-              onChange={(e) => setUsd(e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="mine-note" className={labelCls}>
-              Note (optional)
-            </label>
-            <input
-              id="mine-note"
-              className={inputCls}
-              placeholder="NiceHash"
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-            />
-          </div>
-        </div>
-        <button
-          type="submit"
-          className={`${primaryBtn} mt-3`}
-          disabled={addMut.isPending}
-        >
-          Add log entry
         </button>
       </form>
     </section>

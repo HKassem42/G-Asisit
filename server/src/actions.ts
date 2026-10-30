@@ -97,17 +97,6 @@ const stateResponse = z.object({
       created_at: z.string(),
     }),
   ),
-  miningLogs: z.array(
-    z.object({
-      id: z.number(),
-      log_date: z.string(),
-      hashrate: z.number(),
-      kas_earned: z.number(),
-      usd_value: z.number(),
-      note: z.string(),
-      created_at: z.string(),
-    }),
-  ),
   milestones: z.array(
     z.object({
       id: z.number(),
@@ -168,7 +157,7 @@ async function loadState(ctx: Ctx): Promise<StateResponse> {
   }
   const w = walletRows[0] ?? { balance: 0, mmr: 1000 };
 
-  const [txns, positions, trades, duels, signals, mining, milestones] =
+  const [txns, positions, trades, duels, signals, milestones] =
     await Promise.all([
       db
         .select()
@@ -187,11 +176,6 @@ async function loadState(ctx: Ctx): Promise<StateResponse> {
         .from(schema.signals)
         .orderBy(desc(schema.signals.id))
         .limit(50),
-      db
-        .select()
-        .from(schema.miningLogs)
-        .orderBy(desc(schema.miningLogs.id))
-        .limit(60),
       db
         .select()
         .from(schema.milestones)
@@ -249,15 +233,6 @@ async function loadState(ctx: Ctx): Promise<StateResponse> {
       note: s.note,
       source: s.source,
       created_at: s.createdAt.toISOString(),
-    })),
-    miningLogs: mining.map((m) => ({
-      id: m.id,
-      log_date: m.logDate,
-      hashrate: m.hashrate,
-      kas_earned: m.kasEarned,
-      usd_value: m.usdValue,
-      note: m.note,
-      created_at: m.createdAt.toISOString(),
     })),
     milestones: milestones.map((m) => ({
       id: m.id,
@@ -370,16 +345,6 @@ export const Actions = {
           source: "prototype",
         },
       ]);
-
-      // Mining snapshot from app.py tab 4 (Project-Mine).
-      const today = new Date().toISOString().slice(0, 10);
-      await db.insert(schema.miningLogs).values({
-        logDate: today,
-        hashrate: 245,
-        kasEarned: 142,
-        usdValue: 4.75,
-        note: "Prototype snapshot — Project-Mine tab (app.py)",
-      });
 
       // 8-week build order from README §10, each with its verified
       // status stored on the record (kept in sync with migration 0004,
@@ -1061,42 +1026,6 @@ export const Actions = {
       await db.delete(schema.signals).where(eq(schema.signals.id, args.id));
       ctx.invalidateQueries();
       return { ok: true, message: "Signal removed." };
-    },
-  }),
-
-  addMiningLog: defineAction({
-    request: z.object({
-      logDate: z.string().min(4).max(10),
-      hashrate: z.number().min(0),
-      kasEarned: z.number().min(0),
-      usdValue: z.number().min(0),
-      note: z.string().max(200).default(""),
-    }),
-    response: okResponse,
-    async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
-      await db.insert(schema.miningLogs).values({
-        logDate: args.logDate,
-        hashrate: args.hashrate,
-        kasEarned: args.kasEarned,
-        usdValue: args.usdValue,
-        note: args.note,
-      });
-      ctx.invalidateQueries();
-      return { ok: true, message: "Mining log added." };
-    },
-  }),
-
-  deleteMiningLog: defineAction({
-    request: z.object({ id: z.number().int().positive() }),
-    response: okResponse,
-    async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.miningLogs)
-        .where(eq(schema.miningLogs.id, args.id));
-      ctx.invalidateQueries();
-      return { ok: true, message: "Mining log removed." };
     },
   }),
 
