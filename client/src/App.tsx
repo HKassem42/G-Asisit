@@ -104,6 +104,9 @@ const ghostBtn =
 // ---------- icon system ----------
 // One consistent line-icon set for the whole product: 24px grid,
 // 1.7 stroke, round caps, currentColor. No emoji anywhere in the UI.
+// One deliberate exception: the bottom tab bar uses the full-color
+// TabIcon artwork further below — Kass explicitly prefers the
+// colorful tab icons from his screenshot there.
 
 type IconName =
   | "home"
@@ -248,6 +251,110 @@ export function Icon({
       aria-hidden
     >
       {ICON_PATHS[name]}
+    </svg>
+  );
+}
+
+// ---------- bottom tab bar icons (full color) ----------
+// Kass's preferred tab look, drawn as crisp multi-color SVG artwork
+// (not emoji, not monochrome line icons): red-roof house, crossed
+// silver swords, white chart card with a red rising line, gold
+// trophy, blue profile silhouette. The icons stay in full color on
+// BOTH active and inactive tabs; only the label color and the top
+// indicator line change with the active tab.
+
+type TabIconName = "home" | "battle" | "trade" | "league" | "profile";
+
+function TabSword() {
+  return (
+    <>
+      <path d="M24 3.5 27.2 11v19h-6.4V11z" fill="url(#tabBlade)" />
+      <path d="M24 7v23" stroke="#ffffff" strokeOpacity="0.55" strokeWidth="1.1" />
+      <rect x="15.8" y="30" width="16.4" height="3.8" rx="1.9" fill="#d99a16" />
+      <rect x="22.3" y="33.8" width="3.4" height="7" fill="#5b4632" />
+      <circle cx="24" cy="42.6" r="2.3" fill="#d99a16" />
+    </>
+  );
+}
+
+const TAB_ICON_ART: Record<TabIconName, ReactNode> = {
+  home: (
+    <>
+      <rect x="31.5" y="10" width="5" height="9" fill="#b03a3e" />
+      <rect x="12" y="24" width="24" height="17" fill="#f5e6c4" />
+      <path d="M5 26 24 8l19 18z" fill="#e5484d" />
+      <path d="M5 26 24 8l19 18h-5.2L24 13.4 10.2 26z" fill="#c93338" opacity="0.55" />
+      <rect x="14.6" y="28.5" width="5" height="5" rx="0.8" fill="#79c4e8" />
+      <rect x="28.4" y="28.5" width="5" height="5" rx="0.8" fill="#79c4e8" />
+      <path d="M21 41v-8.6a3 3 0 0 1 6 0V41z" fill="#9c6b30" />
+      <circle cx="9.5" cy="40.5" r="4.2" fill="#43b04c" />
+      <circle cx="38.5" cy="40.5" r="4.2" fill="#43b04c" />
+      <rect x="5" y="41" width="38" height="3.6" rx="1.8" fill="#35963f" />
+    </>
+  ),
+  battle: (
+    <>
+      <defs>
+        <linearGradient id="tabBlade" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stopColor="#eef2f6" />
+          <stop offset="0.5" stopColor="#aeb9c4" />
+          <stop offset="1" stopColor="#7e8b99" />
+        </linearGradient>
+      </defs>
+      <g transform="rotate(40 24 24)">
+        <TabSword />
+      </g>
+      <g transform="rotate(-40 24 24)">
+        <TabSword />
+      </g>
+    </>
+  ),
+  trade: (
+    <>
+      <rect x="6" y="8" width="36" height="32" rx="3" fill="#f7f9fb" stroke="#c3ccd4" strokeWidth="1.2" />
+      <path d="M15 8v32M24 8v32M33 8v32M6 16h36M6 24h36M6 32h36" stroke="#dde4ea" strokeWidth="1" />
+      <path d="M10.5 32.5 18.5 24l6 3.2L36 14.5" fill="none" stroke="#e5322d" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M30.8 13.2 37.2 12.2 36.2 18.6z" fill="#e5322d" />
+      <circle cx="10.5" cy="32.5" r="2.1" fill="#e5322d" />
+    </>
+  ),
+  league: (
+    <>
+      <defs>
+        <linearGradient id="tabGold" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#ffd94d" />
+          <stop offset="0.55" stopColor="#f0b41c" />
+          <stop offset="1" stopColor="#cf8a0e" />
+        </linearGradient>
+      </defs>
+      <path d="M13 10.5H8.6v2.8a6.4 6.4 0 0 0 6.9 6.1" fill="none" stroke="#e3a812" strokeWidth="3.2" strokeLinecap="round" />
+      <path d="M35 10.5h4.4v2.8a6.4 6.4 0 0 1-6.9 6.1" fill="none" stroke="#e3a812" strokeWidth="3.2" strokeLinecap="round" />
+      <path d="M13 7h22v7.2a11 11 0 0 1-22 0z" fill="url(#tabGold)" />
+      <rect x="12" y="5.4" width="24" height="3" rx="1.5" fill="#ffdf6b" />
+      <path d="M24 11.6l1.6 3.3 3.6.4-2.7 2.4.8 3.5L24 19.3l-3.3 1.9.8-3.5-2.7-2.4 3.6-.4z" fill="#fff2b0" />
+      <rect x="22.4" y="25" width="3.2" height="5.4" fill="#d99a16" />
+      <rect x="15" y="30.4" width="18" height="3.6" rx="1" fill="#b97e10" />
+      <rect x="13" y="34.6" width="22" height="3.4" rx="1.2" fill="#a8740c" />
+    </>
+  ),
+  profile: (
+    <>
+      <defs>
+        <linearGradient id="tabBlue" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#6db3f2" />
+          <stop offset="1" stopColor="#2f6fd0" />
+        </linearGradient>
+      </defs>
+      <circle cx="24" cy="16" r="8.2" fill="url(#tabBlue)" />
+      <path d="M8.5 43c0-9.6 7-15.2 15.5-15.2S39.5 33.4 39.5 43z" fill="url(#tabBlue)" />
+    </>
+  ),
+};
+
+export function TabIcon({ name, size = 27 }: { name: TabIconName; size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden>
+      {TAB_ICON_ART[name]}
     </svg>
   );
 }
@@ -697,11 +804,11 @@ export function App() {
             {(
               [
                 ["home", "home", "Home"],
-                ["battle", "swords", "Battle"],
-                ["trade", "chart", "Trade"],
-                ["league", "trophy", "League"],
-                ["more", "user", "Profile"],
-              ] as Array<[TabKey, IconName, string]>
+                ["battle", "battle", "Battle"],
+                ["trade", "trade", "Trade"],
+                ["league", "league", "League"],
+                ["more", "profile", "Profile"],
+              ] as Array<[TabKey, TabIconName, string]>
             ).map(([key, icon, label]) => (
               <button
                 key={key}
@@ -716,7 +823,7 @@ export function App() {
                   <span className="absolute top-0 h-[3px] w-11 rounded-full bg-[var(--accent)]" aria-hidden />
                 ) : null}
                 <span className="relative leading-none" aria-hidden>
-                  <Icon name={icon} size={23} strokeWidth={tab === key ? 2 : 1.7} />
+                  <TabIcon name={icon} size={27} />
                   {key === "battle" && liveDuelCount > 0 ? (
                     <span className="mono absolute -top-1.5 -right-3 grid h-4 min-w-4 place-items-center rounded-full bg-[var(--red)] px-0.5 text-[10px] font-bold text-white">
                       {liveDuelCount}
