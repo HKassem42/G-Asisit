@@ -248,6 +248,7 @@ async function loadState(ctx: Ctx): Promise<StateResponse> {
 
 export const Actions = {
   getState: defineAction({
+    description: "Load the full league state: wallet, positions, trades, duels, signals, and build milestones.",
     request: z.object({}),
     response: stateResponse,
     async handler(ctx): Promise<StateResponse> {
@@ -259,6 +260,7 @@ export const Actions = {
   // prototype (app.py) + blueprint starter state. Idempotent: it only
   // seeds tables that are still empty, and never overwrites user edits.
   importPrototype: defineAction({
+    description: "One-time import of the exact Streamlit prototype snapshot (portfolio, signals, starter wallet, build plan) into empty tables.",
     request: z.object({}),
     response: z.object({ imported: z.boolean(), message: z.string() }),
     async handler(ctx) {
@@ -388,6 +390,7 @@ export const Actions = {
   // Paper trade: inserts the trade and upserts the position with a
   // weighted-average cost, exactly per blueprint §5.1.
   addTrade: defineAction({
+    description: "Record a BTC/USD paper trade and update the position with weighted-average cost.",
     request: z.object({
       symbol: z.string().min(1).max(12),
       side: z.enum(["buy", "sell"]),
@@ -492,6 +495,7 @@ export const Actions = {
   // The UI labels this source honestly. On any fetch failure nothing
   // changes (the last known price stands).
   refreshPrices: defineAction({
+    description: "Fetch the live BTC/USD spot price from the free Coinbase public API and update the BTC position's current price.",
     request: z.object({}),
     response: z.object({
       ok: z.boolean(),
@@ -573,7 +577,66 @@ export const Actions = {
     },
   }),
 
+  // Real BTC/USD candles from the free Coinbase Exchange public API
+  // (no key). Candles come back as [time, low, high, open, close,
+  // volume] arrays, newest first; we return them oldest-first.
+  getBtcCandles: defineAction({
+    description: "Fetch real BTC/USD candles from the free Coinbase public API for the market chart (24H, 7D, or 1M range).",
+    request: z.object({ range: z.enum(["24H", "7D", "1M"]) }),
+    response: z.object({
+      ok: z.boolean(),
+      message: z.string(),
+      candles: z.array(
+        z.object({
+          t: z.number(),
+          open: z.number(),
+          high: z.number(),
+          low: z.number(),
+          close: z.number(),
+          volume: z.number(),
+        }),
+      ),
+    }),
+    async handler(_ctx, args) {
+      const granularity =
+        args.range === "24H" ? 3600 : args.range === "7D" ? 21600 : 86400;
+      const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=${granularity}`;
+      try {
+        const res = await fetch(url, {
+          headers: { accept: "application/json", "user-agent": "paper-trading-league" },
+        });
+        if (!res.ok) {
+          return {
+            ok: false,
+            message: `Coinbase candle source returned ${res.status} — chart shows your stored price instead.`,
+            candles: [],
+          };
+        }
+        const raw = (await res.json()) as unknown;
+        if (!Array.isArray(raw)) {
+          return { ok: false, message: "Coinbase sent no usable candles — chart shows your stored price instead.", candles: [] };
+        }
+        const candles = raw
+          .filter((r): r is number[] => Array.isArray(r) && r.length >= 6 && r.every((n) => typeof n === "number" && Number.isFinite(n)))
+          .map((r) => ({ t: r[0]!, low: r[1]!, high: r[2]!, open: r[3]!, close: r[4]!, volume: r[5]! }))
+          .sort((a, b) => a.t - b.t)
+          .slice(args.range === "24H" ? -24 : args.range === "7D" ? -28 : -30);
+        if (candles.length === 0) {
+          return { ok: false, message: "Coinbase sent no usable candles — chart shows your stored price instead.", candles: [] };
+        }
+        return { ok: true, message: "Coinbase candles loaded.", candles };
+      } catch {
+        return {
+          ok: false,
+          message: "Couldn't reach Coinbase for candles — chart shows your stored price instead.",
+          candles: [],
+        };
+      }
+    },
+  }),
+
   updatePrice: defineAction({
+    description: "Manually set the current price of the BTC position (legacy holdings are not editable).",
     request: z.object({
       positionId: z.number().int().positive(),
       currentPrice: z.number().positive(),
@@ -603,6 +666,7 @@ export const Actions = {
   }),
 
   deletePosition: defineAction({
+    description: "Remove a position row from the book.",
     request: z.object({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args) {
@@ -616,6 +680,7 @@ export const Actions = {
   }),
 
   adjustWallet: defineAction({
+    description: "Adjust the coin balance by a whole-coin amount and record it in the ledger.",
     request: z.object({
       amount: z.number().int().refine((n) => n !== 0, "Amount cannot be zero"),
       label: z.string().min(1).max(120),
@@ -645,6 +710,7 @@ export const Actions = {
   }),
 
   createDuel: defineAction({
+    description: "Create a duel against a bot rival, escrowing the wager from the wallet.",
     request: z.object({
       opponent: z.string().min(1).max(40),
       wager: z.number().int().positive(),
@@ -726,6 +792,7 @@ export const Actions = {
   }),
 
   startDuel: defineAction({
+    description: "Accept a duel: the bot rival's matched escrow is recorded and the battle goes live.",
     request: z.object({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args) {
@@ -756,6 +823,7 @@ export const Actions = {
   }),
 
   completeDuel: defineAction({
+    description: "Finish a duel with manually entered final scores and pay the pot to the winner.",
     request: z.object({
       id: z.number().int().positive(),
       winner: z.enum(["you", "opponent"]),
@@ -828,6 +896,7 @@ export const Actions = {
   // mechanics for a bot opponent, clearly labelled as such in the UI,
   // not a real person's trading record.
   autoCompleteDuel: defineAction({
+    description: "Auto-score a duel from the player's real BTC record with the blueprint formula and settle the pot (voids under 3 trades).",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({
       ok: z.boolean(),
@@ -965,6 +1034,7 @@ export const Actions = {
   }),
 
   voidDuel: defineAction({
+    description: "Void an open or active duel and refund the wager.",
     request: z.object({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args) {
@@ -1001,6 +1071,7 @@ export const Actions = {
   }),
 
   addSignal: defineAction({
+    description: "Post a BTC/USD signal to the signal board.",
     request: z.object({
       symbol: z.string().min(1).max(12),
       signal: z.enum(["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]),
@@ -1025,6 +1096,7 @@ export const Actions = {
   }),
 
   deleteSignal: defineAction({
+    description: "Remove a signal from the signal board.",
     request: z.object({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args) {
@@ -1036,6 +1108,7 @@ export const Actions = {
   }),
 
   toggleMilestone: defineAction({
+    description: "Set the user's own done checkbox on a build-plan milestone.",
     request: z.object({
       id: z.number().int().positive(),
       done: z.boolean(),
