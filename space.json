@@ -2,7 +2,7 @@
   "entry": "client/dist/index.html",
   "managedCronJobs": [],
   "name": "Paper Trading League Game",
-  "platformVersion": 26,
+  "platformVersion": 28,
   "runtime": "typescript",
   "slug": "g-asisit-trading-dashboard"
 }

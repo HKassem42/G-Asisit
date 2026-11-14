@@ -8,6 +8,23 @@
 
 import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
+// The player's own card, created in the onboarding flow (welcome →
+// sign-in / sign-up → player-card setup). One row (id = 1) in this
+// single-player edition. onboarded_at is set when setup completes;
+// until then the app shows the new-player flow instead of the tabs.
+export const playerProfile = sqliteTable("player_profile", {
+  id: integer("id").primaryKey(),
+  handle: text("handle").notNull().default(""),
+  homeMarket: text("home_market").notNull().default(""),
+  onboardedAt: integer("onboarded_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const wallet = sqliteTable("wallet", {
   id: integer("id").primaryKey(),
   // Coins are integers — no floats (blueprint §1 key DB rules).

@@ -43,6 +43,20 @@
       "when": 1793397142745,
       "tag": "0006_week8_note_coinbase_feed",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794556260722,
+      "tag": "0007_player_profile_onboarding",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794598396617,
+      "tag": "0008_retire_prototype_positions_coin_system",
+      "breakpoints": true
     }
   ]
 }

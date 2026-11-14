@@ -20,8 +20,49 @@ import * as schema from "./schema";
 
 const okResponse = z.object({ ok: z.boolean(), message: z.string() });
 
+// Guest access (platform v27) — action classification for this game:
+// - Playing the game IS the intended use of this artifact, so the
+//   gameplay loop (onboarding/profile, trades, price refresh, duels,
+//   signals) is open to whoever can open the app, owner or guest.
+//   There are no per-user private rows or blobs to partition: the
+//   league is one shared game state by design, as it has been since
+//   the first build. Verified in the audit browser session, which
+//   carries no owner viewer — the full new-player flow completes
+//   there, exactly as it does for the owner locally.
+// - Owner-only (guarded below): the admin levers that sit outside
+//   play — importPrototype (one-time seed), adjustWallet (arbitrary
+//   coin mint/burn), deletePosition (removes a book row outright),
+//   toggleMilestone (the owner's own build tracker). A missing viewer
+//   is NOT proof of ownership: only an explicit isOwner === true may
+//   run them, and a denial returns a clear result, never a throw,
+//   and never touches state.
+const OWNER_ONLY_MESSAGE =
+  "Owner-only: guests can watch the league, but only the owner can change it. Nothing was changed.";
+function isOwner(ctx: Ctx): boolean {
+  return ctx.viewer?.isOwner === true;
+}
+
 function round8(n: number): number {
   return Math.round(n * 1e8) / 1e8;
+}
+
+// Live BTC/USD spot from the free Coinbase public API (no key). Returns
+// null on any failure so callers leave state untouched and say so.
+async function fetchBtcSpotPrice(): Promise<number | null> {
+  try {
+    const res = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot", {
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      data?: { amount?: string; base?: string; currency?: string };
+    };
+    if (json.data?.base !== "BTC" || json.data?.currency !== "USD") return null;
+    const amount = Number(json.data.amount);
+    return Number.isFinite(amount) && amount > 0 ? amount : null;
+  } catch {
+    return null;
+  }
 }
 
 // BTC/USD-only edition: BTC is the sole tradable market at launch
@@ -38,6 +79,13 @@ const BTC_ONLY_MESSAGE =
   "This edition trades BTC/USD only — more pairs arrive in a later edition. Nothing was recorded.";
 
 const stateResponse = z.object({
+  profile: z
+    .object({
+      handle: z.string(),
+      home_market: z.string(),
+      onboarded: z.boolean(),
+    })
+    .nullable(),
   wallet: z.object({ balance: z.number(), mmr: z.number() }),
   walletTxns: z.array(
     z.object({
@@ -157,6 +205,9 @@ async function loadState(ctx: Ctx): Promise<StateResponse> {
   }
   const w = walletRows[0] ?? { balance: 0, mmr: 1000 };
 
+  const profileRows = await db.select().from(schema.playerProfile);
+  const prof = profileRows[0];
+
   const [txns, positions, trades, duels, signals, milestones] =
     await Promise.all([
       db
@@ -183,6 +234,13 @@ async function loadState(ctx: Ctx): Promise<StateResponse> {
     ]);
 
   return {
+    profile: prof
+      ? {
+          handle: prof.handle,
+          home_market: prof.homeMarket,
+          onboarded: prof.onboardedAt != null,
+        }
+      : null,
     wallet: { balance: w.balance, mmr: w.mmr },
     walletTxns: txns.map((t) => ({
       id: t.id,
@@ -256,6 +314,127 @@ export const Actions = {
     },
   }),
 
+  // New-player setup: saves the player card (handle + home market),
+  // marks onboarding complete, and pays the one-time 500-coin starter
+  // grant (blueprint §2) if it was never granted. Idempotent on the
+  // grant: a starter_grant ledger row is the proof it was paid, so
+  // replaying setup (or signing in again) never pays twice.
+  completeOnboarding: defineAction({
+    description: "Finish new-player setup: save the player card, mark onboarding complete, and pay the one-time 500-coin starter grant if it was never granted.",
+    request: z.object({
+      handle: z.string().trim().min(2).max(20),
+      homeMarket: z.string().trim().max(40).default(""),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      message: z.string(),
+      granted: z.boolean(),
+    }),
+    async handler(ctx, args) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]*$/.test(args.handle)) {
+        return {
+          ok: false,
+          message:
+            "That handle won't work — use 2–20 characters: letters, numbers, spaces, dots, dashes or underscores.",
+          granted: false,
+        };
+      }
+      const db = ctx.db<typeof schema>();
+      const now = new Date();
+      const existing = await db.select().from(schema.playerProfile);
+      if (existing.length === 0) {
+        await db.insert(schema.playerProfile).values({
+          id: 1,
+          handle: args.handle,
+          homeMarket: args.homeMarket,
+          onboardedAt: now,
+        });
+      } else {
+        await db
+          .update(schema.playerProfile)
+          .set({
+            handle: args.handle,
+            homeMarket: args.homeMarket,
+            onboardedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(schema.playerProfile.id, 1));
+      }
+
+      let walletRows = await db.select().from(schema.wallet);
+      if (walletRows.length === 0) {
+        await db
+          .insert(schema.wallet)
+          .values({ id: 1, balance: 0, mmr: 1000 });
+        walletRows = await db.select().from(schema.wallet);
+      }
+      const w = walletRows[0];
+      const txns = await db.select().from(schema.walletTxns);
+      const alreadyGranted = txns.some((t) => t.type === "starter_grant");
+      let granted = false;
+      if (w && !alreadyGranted) {
+        await db
+          .update(schema.wallet)
+          .set({ balance: w.balance + 500 })
+          .where(eq(schema.wallet.id, w.id));
+        await db.insert(schema.walletTxns).values({
+          type: "starter_grant",
+          amount: 500,
+          label: "Starter grant — 500 coins for joining the league (blueprint §2)",
+        });
+        granted = true;
+      }
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        message: granted
+          ? `Welcome to the league, ${args.handle} — 500 starter coins are in your wallet.`
+          : `Welcome to the league, ${args.handle} — your starter coins were already claimed, so your balance stands as it was.`,
+        granted,
+      };
+    },
+  }),
+
+  // Player-card edits after setup (Profile tab settings). Never
+  // touches onboarding state or the wallet.
+  updateProfile: defineAction({
+    description: "Update the player card's handle and home market from the Profile settings.",
+    request: z.object({
+      handle: z.string().trim().min(2).max(20),
+      homeMarket: z.string().trim().max(40).default(""),
+    }),
+    response: okResponse,
+    async handler(ctx, args) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]*$/.test(args.handle)) {
+        return {
+          ok: false,
+          message:
+            "That handle won't work — use 2–20 characters: letters, numbers, spaces, dots, dashes or underscores.",
+        };
+      }
+      const db = ctx.db<typeof schema>();
+      const existing = await db.select().from(schema.playerProfile);
+      if (existing.length === 0) {
+        await db.insert(schema.playerProfile).values({
+          id: 1,
+          handle: args.handle,
+          homeMarket: args.homeMarket,
+        });
+      } else {
+        await db
+          .update(schema.playerProfile)
+          .set({
+            handle: args.handle,
+            homeMarket: args.homeMarket,
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.playerProfile.id, 1));
+      }
+      ctx.invalidateQueries();
+      return { ok: true, message: "Player card updated." };
+    },
+  }),
+
   // One-time import of the exact values from the user's Streamlit
   // prototype (app.py) + blueprint starter state. Idempotent: it only
   // seeds tables that are still empty, and never overwrites user edits.
@@ -264,6 +443,9 @@ export const Actions = {
     request: z.object({}),
     response: z.object({ imported: z.boolean(), message: z.string() }),
     async handler(ctx) {
+      if (!isOwner(ctx)) {
+        return { imported: false, message: OWNER_ONLY_MESSAGE };
+      }
       const db = ctx.db<typeof schema>();
       const existing = await db.select().from(schema.positions);
       const existingSignals = await db.select().from(schema.signals);
@@ -297,31 +479,11 @@ export const Actions = {
         });
       }
 
-      // Portfolio from app.py tab 2 (amounts + values are the prototype's
-      // exact numbers; price = value / amount, avg cost starts at price).
-      await db.insert(schema.positions).values([
-        {
-          symbol: "BTC",
-          qty: 0.52,
-          avgCost: 64000,
-          currentPrice: 64000,
-          source: "prototype",
-        },
-        {
-          symbol: "ETH",
-          qty: 5.2,
-          avgCost: round8(13420 / 5.2),
-          currentPrice: round8(13420 / 5.2),
-          source: "prototype",
-        },
-        {
-          symbol: "KAS",
-          qty: 12450,
-          avgCost: round8(4180 / 12450),
-          currentPrice: round8(4180 / 12450),
-          source: "prototype",
-        },
-      ]);
+      // One-money coin system: the book starts CLEAN — 500 coins, 0 BTC.
+      // The old prototype dollar portfolio (BTC 0.52 / ETH / KAS) is
+      // retired (migration 0008 deletes prototype positions); a fresh
+      // import must never resurrect it, so no positions are seeded here.
+      // Players open their first BTC position by spending coins.
 
       // ML Signals from app.py tab 3.
       await db.insert(schema.signals).values([
@@ -486,6 +648,197 @@ export const Actions = {
     },
   }),
 
+  // --- One-money coin trading -------------------------------------
+  // Coins are the ONLY money in the game: the 500-coin starter wallet
+  // funds BOTH trades and duel wagers. A buy spends whole coins from
+  // the wallet at the live Coinbase spot price (fractional BTC behind
+  // the scenes, qty = coins / price). A sell closes a slice of the
+  // position measured in current coin value: selling N coins' worth
+  // removes N / livePrice BTC and credits exactly N coins, so price
+  // moves land in the wallet as coin P/L. Coins in (cost) for the
+  // position = qty x avg_cost; current value = qty x live price.
+  buyBtcWithCoins: defineAction({
+    description: "Buy BTC by spending whole coins from the wallet at the live Coinbase price (coins are the game's only money).",
+    request: z.object({
+      coins: z.number().int().positive().max(1000000),
+    }),
+    response: okResponse,
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const recentTrades = await db.select().from(schema.trades);
+      const tradesLastHour = recentTrades.filter(
+        (t) => Date.now() - t.createdAt.getTime() < 3600_000,
+      ).length;
+      if (tradesLastHour >= 60) {
+        return {
+          ok: false,
+          message:
+            "Rate limit: 60 trades per hour max (blueprint anti-abuse). Nothing was recorded.",
+        };
+      }
+      const walletRows = await db.select().from(schema.wallet);
+      const w = walletRows[0];
+      if (!w) return { ok: false, message: "Wallet not initialized." };
+      if (args.coins > w.balance) {
+        return {
+          ok: false,
+          message: `You tried to spend ${args.coins} coins but only ${w.balance} free coins are in your wallet. Coins locked in BTC or escrowed in a duel can't be spent twice.`,
+        };
+      }
+      const price = await fetchBtcSpotPrice();
+      if (price == null) {
+        return {
+          ok: false,
+          message:
+            "Couldn't reach Coinbase for the live BTC price — no coins were spent. Try again in a moment.",
+        };
+      }
+      const qty = round8(args.coins / price);
+      if (!(qty > 0)) {
+        return { ok: false, message: "That coin amount buys too little BTC to record." };
+      }
+      const rows = await db
+        .select()
+        .from(schema.positions)
+        .where(eq(schema.positions.symbol, "BTC"));
+      const pos = rows[0];
+      if (!pos) {
+        await db.insert(schema.positions).values({
+          symbol: "BTC",
+          qty,
+          avgCost: price,
+          currentPrice: price,
+          source: "user",
+        });
+      } else {
+        const newQty = round8(pos.qty + qty);
+        const newAvg =
+          newQty > 0
+            ? round8((pos.qty * pos.avgCost + qty * price) / newQty)
+            : price;
+        await db
+          .update(schema.positions)
+          .set({ qty: newQty, avgCost: newAvg, currentPrice: price, updatedAt: new Date() })
+          .where(eq(schema.positions.id, pos.id));
+      }
+      await db
+        .update(schema.wallet)
+        .set({ balance: w.balance - args.coins })
+        .where(eq(schema.wallet.id, w.id));
+      await db.insert(schema.walletTxns).values({
+        type: "trade_buy",
+        amount: -args.coins,
+        label: `Bought BTC with ${args.coins} coins @ $${price.toLocaleString("en-US", { maximumFractionDigits: 2 })}`,
+      });
+      await db.insert(schema.trades).values({
+        symbol: "BTC",
+        side: "buy",
+        qty,
+        price,
+        note: `${args.coins} coins in`,
+      });
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        message: `Bought ${qty} BTC with ${args.coins} coins @ $${price.toLocaleString("en-US", { maximumFractionDigits: 2 })}. ${w.balance - args.coins} free coins left.`,
+      };
+    },
+  }),
+
+  sellBtcForCoins: defineAction({
+    description: "Sell a coin-value slice of the BTC position (or close it all) at the live Coinbase price, crediting coins back to the wallet.",
+    request: z.object({
+      coins: z.number().int().positive().max(1000000).optional(),
+      closeAll: z.boolean().default(false),
+    }),
+    response: okResponse,
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const recentTrades = await db.select().from(schema.trades);
+      const tradesLastHour = recentTrades.filter(
+        (t) => Date.now() - t.createdAt.getTime() < 3600_000,
+      ).length;
+      if (tradesLastHour >= 60) {
+        return {
+          ok: false,
+          message:
+            "Rate limit: 60 trades per hour max (blueprint anti-abuse). Nothing was recorded.",
+        };
+      }
+      const rows = await db
+        .select()
+        .from(schema.positions)
+        .where(eq(schema.positions.symbol, "BTC"));
+      const pos = rows[0];
+      if (!pos || pos.qty <= 0) {
+        return { ok: false, message: "No open BTC position to sell." };
+      }
+      const price = await fetchBtcSpotPrice();
+      if (price == null) {
+        return {
+          ok: false,
+          message:
+            "Couldn't reach Coinbase for the live BTC price — nothing was sold. Try again in a moment.",
+        };
+      }
+      const currentValue = pos.qty * price;
+      let credit: number;
+      let qtyToSell: number;
+      if (args.closeAll) {
+        credit = Math.round(currentValue);
+        qtyToSell = pos.qty;
+        if (credit <= 0) {
+          return { ok: false, message: "Your BTC position is worth less than 1 coin right now — nothing to close." };
+        }
+      } else {
+        if (args.coins == null) {
+          return { ok: false, message: "Pick how many coins' worth of BTC to sell, or close all." };
+        }
+        if (args.coins > currentValue + 1e-9) {
+          return {
+            ok: false,
+            message: `You tried to sell ${args.coins} coins' worth but your BTC position is only worth ${Math.floor(currentValue)} coins right now.`,
+          };
+        }
+        credit = args.coins;
+        qtyToSell = round8(credit / price);
+      }
+      const walletRows = await db.select().from(schema.wallet);
+      const w = walletRows[0];
+      if (!w) return { ok: false, message: "Wallet not initialized." };
+      const newQty = round8(pos.qty - qtyToSell);
+      if (args.closeAll || newQty <= 1e-9) {
+        await db.delete(schema.positions).where(eq(schema.positions.id, pos.id));
+      } else {
+        await db
+          .update(schema.positions)
+          .set({ qty: newQty, currentPrice: price, updatedAt: new Date() })
+          .where(eq(schema.positions.id, pos.id));
+      }
+      await db
+        .update(schema.wallet)
+        .set({ balance: w.balance + credit })
+        .where(eq(schema.wallet.id, w.id));
+      await db.insert(schema.walletTxns).values({
+        type: "trade_sell",
+        amount: credit,
+        label: `Sold BTC for ${credit} coins @ $${price.toLocaleString("en-US", { maximumFractionDigits: 2 })}`,
+      });
+      await db.insert(schema.trades).values({
+        symbol: "BTC",
+        side: "sell",
+        qty: qtyToSell,
+        price,
+        note: `${credit} coins out`,
+      });
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        message: `Sold ${qtyToSell} BTC for ${credit} coins @ $${price.toLocaleString("en-US", { maximumFractionDigits: 2 })}. ${w.balance + credit} free coins now.`,
+      };
+    },
+  }),
+
   // Live quote refresh (Week 8 price feed): pulls the real BTC/USD spot
   // price from the free Coinbase public API (no key, no account, no cost)
   // and writes it into the BTC position's current_price. BTC/USD is the
@@ -517,7 +870,7 @@ export const Actions = {
         if (!res.ok) {
           return {
             ok: false,
-            message: `Coinbase quote source returned ${res.status} — price left unchanged (last known price stands). You can still update the BTC price by hand.`,
+            message: `Coinbase quote source returned ${res.status} — price left unchanged (last known price stands).`,
             updated: [],
             asOf: null,
           };
@@ -535,7 +888,7 @@ export const Actions = {
         return {
           ok: false,
           message:
-            "Couldn't reach the Coinbase quote source — prices left unchanged (last known price stands). You can still update prices by hand.",
+            "Couldn't reach the Coinbase quote source — prices left unchanged (last known price stands).",
           updated: [],
           asOf: null,
         };
@@ -670,6 +1023,7 @@ export const Actions = {
     request: z.object({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args) {
+      if (!isOwner(ctx)) return { ok: false, message: OWNER_ONLY_MESSAGE };
       const db = ctx.db<typeof schema>();
       await db
         .delete(schema.positions)
@@ -687,6 +1041,7 @@ export const Actions = {
     }),
     response: okResponse,
     async handler(ctx, args) {
+      if (!isOwner(ctx)) return { ok: false, message: OWNER_ONLY_MESSAGE };
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.wallet);
       const w = rows[0];
@@ -1115,6 +1470,7 @@ export const Actions = {
     }),
     response: okResponse,
     async handler(ctx, args) {
+      if (!isOwner(ctx)) return { ok: false, message: OWNER_ONLY_MESSAGE };
       const db = ctx.db<typeof schema>();
       await db
         .update(schema.milestones)

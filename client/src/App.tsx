@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -8,15 +8,6 @@ type Position = State["positions"][number];
 type Duel = State["duels"][number];
 
 // ---------- formatting helpers ----------
-
-function fmtUsd(n: number): string {
-  return n.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
 
 function fmtPrice(n: number): string {
   if (n >= 1000)
@@ -766,39 +757,231 @@ function BtcSparkline() {
   );
 }
 
-function CandleChart({ candles }: { candles: Candle[] }) {
+type ChartType = "candles" | "line" | "heikin";
+
+function heikinAshi(src: Candle[]): Candle[] {
+  const out: Candle[] = [];
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]!;
+    const close = (c.open + c.high + c.low + c.close) / 4;
+    const prev = out[i - 1];
+    const open = prev ? (prev.open + prev.close) / 2 : (c.open + c.close) / 2;
+    out.push({
+      t: c.t,
+      open,
+      close,
+      high: Math.max(c.high, open, close),
+      low: Math.min(c.low, open, close),
+      volume: c.volume,
+    });
+  }
+  return out;
+}
+
+function emaSeries(values: number[], period: number): Array<number | null> {
+  const out: Array<number | null> = values.map(() => null);
+  if (values.length < period) return out;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  out[period - 1] = ema;
+  for (let i = period; i < values.length; i++) {
+    ema = values[i]! * k + ema * (1 - k);
+    out[i] = ema;
+  }
+  return out;
+}
+
+function rsiSeries(closes: number[], period = 14): Array<number | null> {
+  const out: Array<number | null> = closes.map(() => null);
+  if (closes.length <= period) return out;
+  let gain = 0;
+  let loss = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i]! - closes[i - 1]!;
+    if (d >= 0) gain += d; else loss -= d;
+  }
+  gain /= period;
+  loss /= period;
+  out[period] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i]! - closes[i - 1]!;
+    gain = (gain * (period - 1) + Math.max(d, 0)) / period;
+    loss = (loss * (period - 1) + Math.max(-d, 0)) / period;
+    out[i] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+  }
+  return out;
+}
+
+function macdSeries(closes: number[]) {
+  const fast = emaSeries(closes, 12);
+  const slow = emaSeries(closes, 26);
+  const macd: Array<number | null> = closes.map((_, i) =>
+    fast[i] != null && slow[i] != null ? fast[i]! - slow[i]! : null,
+  );
+  const macdVals = macd.filter((v): v is number => v != null);
+  const sigVals = emaSeries(macdVals, 9);
+  const signal: Array<number | null> = closes.map(() => null);
+  let j = 0;
+  for (let i = 0; i < macd.length; i++) {
+    if (macd[i] != null) {
+      signal[i] = sigVals[j] ?? null;
+      j++;
+    }
+  }
+  const hist: Array<number | null> = closes.map((_, i) =>
+    macd[i] != null && signal[i] != null ? macd[i]! - signal[i]! : null,
+  );
+  return { macd, signal, hist };
+}
+
+function lastNum(a: Array<number | null>): number | null {
+  for (let i = a.length - 1; i >= 0; i--) if (a[i] != null) return a[i]!;
+  return null;
+}
+
+// Market chart with a reserved right gutter: candles/line live ONLY in
+// the plot area; the dashed last-price line runs across the plot and
+// its price tag sits in the gutter, so the tag can never cover a candle.
+function MarketChart({
+  candles,
+  chartType,
+  showEma,
+  showRsi,
+  showMacd,
+}: {
+  candles: Candle[];
+  chartType: ChartType;
+  showEma: boolean;
+  showRsi: boolean;
+  showMacd: boolean;
+}) {
+  const display = chartType === "heikin" ? heikinAshi(candles) : candles;
+  const closes = display.map((c) => c.close);
+  const ema = emaSeries(closes, 20);
+  const rsi = rsiSeries(closes, 14);
+  const macd = macdSeries(closes);
+  const emaNow = lastNum(ema);
+  const rsiNow = lastNum(rsi);
+  const macdNow = lastNum(macd.macd);
+  const lastClose = closes[closes.length - 1]!;
+
   const W = 360;
+  const GUTTER = 62;
+  const PLOT = W - GUTTER;
   const H = 190;
-  const max = Math.max(...candles.map((c) => c.high));
-  const min = Math.min(...candles.map((c) => c.low));
+  const highs = display.map((c) => c.high);
+  const lows = display.map((c) => c.low);
+  if (showEma) ema.forEach((v) => { if (v != null) { highs.push(v); lows.push(v); } });
+  const max = Math.max(...highs);
+  const min = Math.min(...lows);
   const span = Math.max(max - min, 1);
   const y = (v: number) => 8 + ((max - v) / span) * (H - 24);
-  const step = W / candles.length;
+  const step = PLOT / display.length;
   const bw = Math.max(3, step * 0.55);
-  const last = candles[candles.length - 1]!;
+  const linePts = display
+    .map((c, i) => `${(i * step + step / 2).toFixed(1)},${y(c.close).toFixed(1)}`)
+    .join(" ");
+  const emaPts = ema
+    .map((v, i) => (v == null ? null : `${(i * step + step / 2).toFixed(1)},${y(v).toFixed(1)}`))
+    .filter(Boolean)
+    .join(" ");
+  const typeLabel = chartType === "candles" ? "candlestick" : chartType === "line" ? "line" : "Heikin-Ashi";
+
+  // RSI sub-panel geometry
+  const RH = 54;
+  const rsiY = (v: number) => 6 + ((100 - v) / 100) * (RH - 12);
+  const rsiPts = rsi
+    .map((v, i) => (v == null ? null : `${(i * step + step / 2).toFixed(1)},${rsiY(v).toFixed(1)}`))
+    .filter(Boolean)
+    .join(" ");
+  // MACD sub-panel geometry
+  const MH = 62;
+  const allMacd = [...macd.macd, ...macd.signal, ...macd.hist].filter((v): v is number => v != null);
+  const mMax = allMacd.length ? Math.max(...allMacd.map(Math.abs), 1) : 1;
+  const macdY = (v: number) => MH / 2 - (v / mMax) * (MH / 2 - 5);
+  const macdPts = macd.macd
+    .map((v, i) => (v == null ? null : `${(i * step + step / 2).toFixed(1)},${macdY(v).toFixed(1)}`))
+    .filter(Boolean)
+    .join(" ");
+  const sigPts = macd.signal
+    .map((v, i) => (v == null ? null : `${(i * step + step / 2).toFixed(1)},${macdY(v).toFixed(1)}`))
+    .filter(Boolean)
+    .join(" ");
+
   return (
-    <div className="relative">
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label={`BTC/USD candlestick chart, high ${fmtPrice(max)}, low ${fmtPrice(min)}, last ${fmtPrice(last.close)}`}>
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label={`BTC/USD ${typeLabel} chart, high ${fmtPrice(max)}, low ${fmtPrice(min)}, last ${fmtPrice(lastClose)}${emaNow != null && showEma ? `, EMA 20 at ${fmtPrice(emaNow)}` : ""}`}>
         {[0.25, 0.5, 0.75].map((f) => (
-          <line key={f} x1={0} x2={W} y1={H * f} y2={H * f} stroke="var(--border)" strokeWidth="0.6" strokeDasharray="3 4" />
+          <line key={f} x1={0} x2={PLOT} y1={H * f} y2={H * f} stroke="var(--border)" strokeWidth="0.6" strokeDasharray="3 4" />
         ))}
-        {candles.map((c, i) => {
-          const cx = i * step + step / 2;
-          const up = c.close >= c.open;
-          const col = up ? "var(--accent)" : "var(--red)";
-          const top = y(Math.max(c.open, c.close));
-          const bot = y(Math.min(c.open, c.close));
-          return (
-            <g key={c.t}>
-              <line x1={cx} x2={cx} y1={y(c.high)} y2={y(c.low)} stroke={col} strokeWidth="1.1" />
-              <rect x={cx - bw / 2} y={top} width={bw} height={Math.max(bot - top, 1.6)} fill={col} rx="1" />
-            </g>
-          );
-        })}
+        {chartType === "line" ? (
+          <polyline points={linePts} fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinejoin="round" />
+        ) : (
+          display.map((c, i) => {
+            const cx = i * step + step / 2;
+            const up = c.close >= c.open;
+            const col = up ? "var(--accent)" : "var(--red)";
+            const top = y(Math.max(c.open, c.close));
+            const bot = y(Math.min(c.open, c.close));
+            return (
+              <g key={c.t}>
+                <line x1={cx} x2={cx} y1={y(c.high)} y2={y(c.low)} stroke={col} strokeWidth="1.1" />
+                <rect x={cx - bw / 2} y={top} width={bw} height={Math.max(bot - top, 1.6)} fill={col} rx="1" />
+              </g>
+            );
+          })
+        )}
+        {showEma && emaPts ? (
+          <polyline points={emaPts} fill="none" stroke="#38bdf8" strokeWidth="1.4" strokeLinejoin="round" opacity="0.9" />
+        ) : null}
+        {/* Dashed last-price level across the plot, tag in the gutter */}
+        <line x1={0} x2={W - 2} y1={y(lastClose)} y2={y(lastClose)} stroke="var(--accent)" strokeWidth="1" strokeDasharray="5 4" opacity="0.85" />
+        <rect x={PLOT + 3} y={Math.max(0, Math.min(H - 18, y(lastClose) - 9))} width={GUTTER - 5} height={18} rx={5} fill="var(--accent)" />
+        <text x={PLOT + 3 + (GUTTER - 5) / 2} y={Math.max(9, Math.min(H - 5, y(lastClose) + 3.5))} textAnchor="middle" fontSize="9.5" fontWeight="700" fill="var(--accent-ink)" fontFamily="var(--font-mono)">
+          {fmtPrice(lastClose)}
+        </text>
       </svg>
-      <span className="mono absolute right-0 rounded-md bg-[var(--accent)] px-1.5 py-0.5 text-[10px] font-bold text-[var(--accent-ink)]" style={{ top: `${(y(last.close) / H) * 100}%` }}>
-        {fmtPrice(last.close)}
-      </span>
+      <div className="mono mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-[var(--dim)]">
+        <span>Last <span className="font-bold text-[var(--text)]">${fmtPrice(lastClose)}</span> · dashed level line, tag in the side gutter</span>
+        {showEma ? <span style={{ color: "#38bdf8" }}>— EMA 20 {emaNow != null ? `$${fmtPrice(emaNow)}` : "warming up"}</span> : null}
+      </div>
+
+      {showRsi ? (
+        <div className="mt-3 rounded-2xl bg-[var(--surface2)] px-3 py-2">
+          <div className="flex items-baseline justify-between">
+            <p className="mono text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">RSI (14)</p>
+            <p className="mono text-xs font-bold">{rsiNow != null ? rsiNow.toFixed(1) : "warming up"}</p>
+          </div>
+          <svg viewBox={`0 0 ${W} ${RH}`} className="mt-1 w-full" role="img" aria-label={`RSI 14 sub-panel, current value ${rsiNow != null ? rsiNow.toFixed(1) : "not enough candles yet"}`}>
+            <line x1={0} x2={PLOT} y1={rsiY(70)} y2={rsiY(70)} stroke="var(--border)" strokeWidth="0.6" strokeDasharray="3 4" />
+            <line x1={0} x2={PLOT} y1={rsiY(50)} y2={rsiY(50)} stroke="var(--border-strong)" strokeWidth="0.6" />
+            <line x1={0} x2={PLOT} y1={rsiY(30)} y2={rsiY(30)} stroke="var(--border)" strokeWidth="0.6" strokeDasharray="3 4" />
+            {rsiPts ? <polyline points={rsiPts} fill="none" stroke="#c084fc" strokeWidth="1.6" strokeLinejoin="round" /> : null}
+            <text x={PLOT + 6} y={rsiY(70) + 3} fontSize="8.5" fill="var(--faint)" fontFamily="var(--font-mono)">70</text>
+            <text x={PLOT + 6} y={rsiY(30) + 3} fontSize="8.5" fill="var(--faint)" fontFamily="var(--font-mono)">30</text>
+          </svg>
+        </div>
+      ) : null}
+
+      {showMacd ? (
+        <div className="mt-2 rounded-2xl bg-[var(--surface2)] px-3 py-2">
+          <div className="flex items-baseline justify-between">
+            <p className="mono text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">MACD (12 · 26 · 9)</p>
+            <p className="mono text-xs font-bold">{macdNow != null ? macdNow.toFixed(1) : "warming up"}</p>
+          </div>
+          <svg viewBox={`0 0 ${W} ${MH}`} className="mt-1 w-full" role="img" aria-label={`MACD sub-panel, current value ${macdNow != null ? macdNow.toFixed(1) : "not enough candles yet"}`}>
+            <line x1={0} x2={PLOT} y1={MH / 2} y2={MH / 2} stroke="var(--border-strong)" strokeWidth="0.6" />
+            {macd.hist.map((v, i) =>
+              v == null ? null : (
+                <rect key={i} x={i * step + step / 2 - bw / 2} y={Math.min(macdY(v), MH / 2)} width={bw} height={Math.max(Math.abs(macdY(v) - MH / 2), 0.8)} fill={v >= 0 ? "var(--accent)" : "var(--red)"} opacity="0.45" />
+              ),
+            )}
+            {macdPts ? <polyline points={macdPts} fill="none" stroke="#38bdf8" strokeWidth="1.5" strokeLinejoin="round" /> : null}
+            {sigPts ? <polyline points={sigPts} fill="none" stroke="#ffc93c" strokeWidth="1.2" strokeLinejoin="round" /> : null}
+          </svg>
+          <p className="mono text-[10px] text-[var(--dim)]"><span style={{ color: "#38bdf8" }}>— MACD</span> · <span style={{ color: "var(--gold)" }}>— Signal</span> · bars = histogram</p>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -893,6 +1076,826 @@ function FeaturedRooms({ onChallenge }: { onChallenge: (name: string) => void })
   );
 }
 
+// ---------- player identity helpers ----------
+
+// Avatar initials come from the player's stored handle — the same
+// monogram treatment the app bar, player card, battle screen and
+// standings all share.
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "K";
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
+  return (parts[0]![0]! + parts[1]![0]!).toUpperCase();
+}
+
+const HOME_MARKETS = [
+  "Detroit",
+  "Chicago",
+  "New York",
+  "Los Angeles",
+  "Houston",
+  "London",
+  "Tokyo",
+  "Somewhere else",
+];
+
+// ---------- how the league works (3-card tour) ----------
+// Shown as the last step of onboarding and replayable any time from
+// Profile settings. Every claim in it is a rule the app actually
+// enforces server-side (escrow, 2× pot, §6 weights, min-3-trades).
+
+function HowItWorks({
+  onDone,
+  doneLabel,
+}: {
+  onDone: () => void;
+  doneLabel: string;
+}) {
+  const [step, setStep] = useState(0);
+  const steps: Array<{ icon: IconName; title: string; body: string }> = [
+    {
+      icon: "chart",
+      title: "Trade BTC/USD",
+      body: "One market, priced live from Coinbase around the clock. Coins are the only money: everyone starts with 500, you spend coins to buy BTC in Trade and the same coins escrow your duel wagers. Sell and the coins — plus or minus your P/L — land back in your wallet.",
+    },
+    {
+      icon: "swords",
+      title: "Duel for the pot",
+      body: "Pick a room and escrow your wager; the bot rival matches it, so the pot is a real 2× your wager and the winner takes it. Scores are five parts: Returns 40 · Risk control 25 · Consistency 15 · Activity 10 · Winner bonus 10. A duel needs at least 3 trades on your record to score — under that it voids and refunds you.",
+    },
+    {
+      icon: "trophy",
+      title: "Climb the league",
+      body: "Wins pay the pot plus +25 MMR; losses cost −15. Finish season quests, light up badges, fill the trophy shelf, and chase Nova at the top of the standings. Tournaments and duel rooms run 24/7 — the arena never closes.",
+    },
+  ];
+  const s = steps[step]!;
+  const last = step === steps.length - 1;
+  return (
+    <div>
+      <div className="purple-card rounded-[var(--radius)] p-6 text-center">
+        <span
+          className="mx-auto grid h-16 w-16 place-items-center rounded-full bg-[var(--accent)] text-[var(--accent-ink)]"
+          style={{ boxShadow: "0 0 26px rgba(198,241,53,0.35)" }}
+          aria-hidden
+        >
+          <Icon name={s.icon} size={30} strokeWidth={2} />
+        </span>
+        <p className="font-display mt-4 text-[26px] leading-tight font-black">
+          {s.title}
+        </p>
+        <p className="mx-auto mt-2 max-w-[320px] text-sm leading-relaxed text-[#d8cff7]">
+          {s.body}
+        </p>
+      </div>
+      <div className="mt-4 flex items-center justify-center gap-1.5" aria-hidden>
+        {steps.map((x, i) => (
+          <span
+            key={x.title}
+            className="h-2 rounded-full"
+            style={{
+              width: i === step ? 22 : 8,
+              background: i === step ? "var(--accent)" : "var(--surface3)",
+            }}
+          />
+        ))}
+      </div>
+      <p className="mono mt-2 text-center text-[11px] text-[var(--dim)]">
+        Step {step + 1} of {steps.length} — how the league works
+      </p>
+      <div className="mt-4 flex gap-2">
+        {step > 0 ? (
+          <button
+            type="button"
+            className={`${ghostBtn} flex-1 py-3`}
+            onClick={() => setStep(step - 1)}
+          >
+            Back
+          </button>
+        ) : null}
+        {last ? (
+          <button
+            type="button"
+            className="flex-1 rounded-full bg-[var(--accent)] py-3.5 font-display text-sm font-black tracking-wide text-[var(--accent-ink)] uppercase"
+            onClick={onDone}
+          >
+            {doneLabel}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="flex-1 rounded-full bg-[var(--accent)] py-3.5 font-display text-sm font-black tracking-wide text-[var(--accent-ink)] uppercase"
+            onClick={() => setStep(step + 1)}
+          >
+            Next
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- professional sign-in buttons ----------
+// The store-build sign-in pattern (Google / Apple / email) in its real
+// visual style. Honest scope, stated on screen: one-tap Google/Apple
+// sign-in activates with the store build; in this edition every button
+// continues into the same player-card setup — no OAuth flow is faked
+// and no email is collected or claimed.
+function AuthButtons({ onContinue }: { onContinue: () => void }) {
+  return (
+    <div>
+      <div className="space-y-2.5">
+        <button
+          type="button"
+          onClick={onContinue}
+          className="flex w-full items-center justify-center gap-3 rounded-full bg-white py-3.5 font-display text-[15px] font-extrabold text-[#1f1f1f]"
+          aria-label="Continue with Google — continues to player card setup in this edition"
+        >
+          <svg width="19" height="19" viewBox="0 0 48 48" aria-hidden>
+            <path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3l5.7-5.7C34.3 6.1 29.3 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.1-2.6-.4-3.9z" />
+            <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.9 1.2 8 3l5.7-5.7C34.3 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z" />
+            <path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z" />
+            <path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C36.9 39.2 44 34 44 24c0-1.3-.1-2.6-.4-3.9z" />
+          </svg>
+          Continue with Google
+        </button>
+        <button
+          type="button"
+          onClick={onContinue}
+          className="flex w-full items-center justify-center gap-3 rounded-full bg-black py-3.5 font-display text-[15px] font-extrabold text-white"
+          style={{ boxShadow: "inset 0 0 0 1px var(--border-strong)" }}
+          aria-label="Continue with Apple — continues to player card setup in this edition"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M17.05 12.54c-.03-2.89 2.36-4.27 2.47-4.34-1.35-1.97-3.44-2.24-4.18-2.27-1.78-.18-3.47 1.05-4.37 1.05-.9 0-2.29-1.02-3.77-1-1.94.03-3.72 1.13-4.72 2.86-2.01 3.49-.51 8.66 1.45 11.5.96 1.39 2.1 2.94 3.6 2.88 1.45-.06 2-.93 3.74-.93s2.24.93 3.77.9c1.56-.02 2.55-1.41 3.5-2.8 1.1-1.61 1.56-3.17 1.58-3.25-.03-.01-3.04-1.17-3.07-4.6zM14.16 4.06c.8-.97 1.34-2.31 1.19-3.65-1.15.05-2.55.77-3.38 1.73-.74.86-1.39 2.23-1.22 3.55 1.29.1 2.6-.65 3.41-1.63z" />
+          </svg>
+          Continue with Apple
+        </button>
+        <button
+          type="button"
+          onClick={onContinue}
+          className="flex w-full items-center justify-center gap-3 rounded-full bg-[var(--surface3)] py-3.5 font-display text-[15px] font-extrabold text-[var(--text)]"
+          style={{ boxShadow: "inset 0 0 0 1px var(--border-strong)" }}
+          aria-label="Continue with email — continues to player card setup in this edition"
+        >
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <rect x="3" y="5.5" width="18" height="13" rx="2.5" />
+            <path d="m4 7 8 6 8-6" />
+          </svg>
+          Continue with email
+        </button>
+      </div>
+      <p className="mono mt-3 text-center text-[11px] leading-relaxed text-[var(--faint)]">
+        One-tap Google &amp; Apple sign-in activates with the store build.
+        In this edition these buttons take you straight to player-card
+        setup — no email is collected here yet.
+      </p>
+    </div>
+  );
+}
+
+// ---------- new-player flow: welcome → sign in / sign up → setup → tour ----------
+// What a brand-new player sees on first open, before the tabs exist
+// for them. The profile and the starter grant are real server state
+// (completeOnboarding); the flow stays up until the stored profile
+// says onboarding is done. A failed save keeps everything typed and
+// shows the server's answer — nothing pretends to be saved.
+
+function Onboarding({
+  data,
+  onSetupSaved,
+  onFinish,
+}: {
+  data: State;
+  onSetupSaved: (message: string) => void;
+  onFinish: () => void;
+}) {
+  const [step, setStep] = useState<"welcome" | "signin" | "profile" | "tour">(
+    "welcome",
+  );
+  const [handle, setHandle] = useState(data.profile?.handle ?? "");
+  const [market, setMarket] = useState(data.profile?.home_market ?? "");
+  const [error, setError] = useState("");
+
+  // A truly fresh install has no rows at all: pull the prototype
+  // snapshot in once, in the background, so setup lands on a real
+  // league (starter wallet, build plan, signals board).
+  const isEmpty =
+    data.positions.length === 0 &&
+    data.signals.length === 0 &&
+    data.milestones.length === 0;
+  const importTried = useRef(false);
+  useEffect(() => {
+    if (isEmpty && !importTried.current) {
+      importTried.current = true;
+      api.importPrototype({}).catch(() => {
+        /* the Home tab keeps its manual import card as the fallback */
+      });
+    }
+  }, [isEmpty]);
+
+  const completeMut = useMutation({
+    mutationFn: (args: { handle: string; homeMarket: string }) =>
+      api.completeOnboarding(args),
+    onSuccess: (r) => {
+      if (r.ok) {
+        setError("");
+        onSetupSaved(r.message);
+        setStep("tour");
+      } else {
+        setError(r.message);
+      }
+    },
+    onError: () =>
+      setError(
+        "Setup didn't save — check your connection and try again. Everything you typed is still here.",
+      ),
+  });
+
+  const submitSetup = (e: FormEvent) => {
+    e.preventDefault();
+    if (handle.trim().length < 2) {
+      setError("Pick a handle of at least 2 characters — it's the name on your player card and the standings.");
+      return;
+    }
+    completeMut.mutate({ handle: handle.trim(), homeMarket: market });
+  };
+
+  const mmr = data.wallet.mmr;
+  const previewInitials = initialsOf(handle.trim() || "You");
+
+  return (
+    <div className="min-h-screen bg-black text-[var(--text)]">
+      <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <div className="relative mx-auto flex min-h-screen w-full max-w-[430px] flex-col bg-[var(--bg)] sm:border-x sm:border-[var(--border)]">
+        <main className="w-full min-w-0 flex-1 px-4 pt-6 pb-10">
+          {step === "welcome" ? (
+            <div className="tab-enter">
+              <div className="flex items-center gap-2">
+                <span className="live-dot h-2.5 w-2.5 rounded-full bg-[var(--accent)]" aria-hidden />
+                <p className="mono text-[11px] font-bold tracking-[0.18em] text-[var(--accent)] uppercase">
+                  Season 1 · Live · 24/7 arena
+                </p>
+                <span className="mono ml-auto rounded-full bg-[var(--surface2)] px-2 py-0.5 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">
+                  BTC/USD only
+                </span>
+              </div>
+              <span
+                className="mt-8 grid h-20 w-20 place-items-center rounded-full bg-[var(--accent)] text-[var(--accent-ink)]"
+                style={{ boxShadow: "0 0 34px rgba(198,241,53,0.4)" }}
+                aria-hidden
+              >
+                <Icon name="swords" size={38} strokeWidth={2} />
+              </span>
+              <h1 className="font-display mt-5 text-[40px] leading-[0.95] font-black tracking-tight">
+                Paper Trading
+                <br />
+                League
+              </h1>
+              <p className="mt-3 max-w-[330px] text-[15px] leading-relaxed text-[var(--dim)]">
+                1v1 BTC/USD duels and tournaments, scored like a sports
+                league. Real market prices, paper money — win coins,
+                climb the board, take the trophies.
+              </p>
+              <div className="hero-wash mt-5 rounded-[var(--radius)] p-4">
+                <BtcSparkline />
+                <div className="mono mt-3 grid grid-cols-3 gap-2 text-center">
+                  <div className="rounded-2xl bg-[var(--surface2)] px-1 py-2.5">
+                    <p className="font-display text-[15px] font-black">BTC/USD</p>
+                    <p className="mt-0.5 text-[9px] font-bold tracking-widest text-[var(--dim)] uppercase">the only market</p>
+                  </div>
+                  <div className="rounded-2xl bg-[var(--surface2)] px-1 py-2.5">
+                    <p className="font-display text-[15px] font-black text-[var(--gold)]">500</p>
+                    <p className="mt-0.5 text-[9px] font-bold tracking-widest text-[var(--dim)] uppercase">starter coins</p>
+                  </div>
+                  <div className="rounded-2xl bg-[var(--surface2)] px-1 py-2.5">
+                    <p className="font-display text-[15px] font-black">24/7</p>
+                    <p className="mt-0.5 text-[9px] font-bold tracking-widest text-[var(--dim)] uppercase">rooms &amp; cups</p>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-6">
+                <AuthButtons onContinue={() => setStep("profile")} />
+              </div>
+              <div className="mt-4 flex items-center gap-3" aria-hidden>
+                <span className="h-px flex-1 bg-[var(--border)]" />
+                <span className="mono text-[10px] font-bold tracking-widest text-[var(--faint)] uppercase">then build your player card</span>
+                <span className="h-px flex-1 bg-[var(--border)]" />
+              </div>
+              <button
+                type="button"
+                className="mt-4 w-full rounded-full bg-[var(--accent)] py-4 font-display text-base font-black tracking-wide text-[var(--accent-ink)] uppercase"
+                onClick={() => setStep("profile")}
+              >
+                Create my player card — claim 500 coins
+              </button>
+              <button
+                type="button"
+                className="mt-2.5 w-full py-2 text-center text-sm font-bold text-[var(--accent)]"
+                onClick={() => setStep("signin")}
+              >
+                I already play — sign in
+              </button>
+              <p className="mono mt-4 text-center text-[11px] leading-relaxed text-[var(--faint)]">
+                Paper trading only — coins have no cash value, wins pay
+                coins and rank, never money. For players 17+.
+              </p>
+            </div>
+          ) : null}
+
+          {step === "signin" ? (
+            <div className="tab-enter">
+              <button
+                type="button"
+                className="mono text-xs font-bold text-[var(--dim)]"
+                onClick={() => setStep("welcome")}
+              >
+                ← Back
+              </button>
+              <h1 className="font-display mt-4 text-[32px] leading-tight font-black">
+                Welcome back
+              </h1>
+              <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
+                This edition keeps your player card in the app on this
+                device — no password to remember, nothing to reset.
+                One-tap Google &amp; Apple sign-in activates with the
+                store build. Enter the handle on your card and you're in.
+              </p>
+              <div className="mt-5">
+                <AuthButtons onContinue={() => setStep("profile")} />
+              </div>
+              <form onSubmit={submitSetup} className="mt-5">
+                <label htmlFor="signin-handle" className={labelCls}>
+                  Your player handle
+                </label>
+                <input
+                  id="signin-handle"
+                  className={inputCls}
+                  placeholder="e.g. Kass"
+                  maxLength={20}
+                  value={handle}
+                  onChange={(e) => setHandle(e.target.value)}
+                  autoComplete="nickname"
+                />
+                {error ? (
+                  <p role="alert" className="mono mt-3 rounded-2xl border border-[var(--red)] px-3 py-2.5 text-[13px] text-[var(--red)]">
+                    {error}
+                  </p>
+                ) : null}
+                <button
+                  type="submit"
+                  className="mt-4 w-full rounded-full bg-[var(--accent)] py-4 font-display text-base font-black tracking-wide text-[var(--accent-ink)] uppercase disabled:opacity-40"
+                  disabled={completeMut.isPending}
+                >
+                  {completeMut.isPending ? "Signing in…" : "Sign in"}
+                </button>
+              </form>
+              <button
+                type="button"
+                className="mt-4 w-full text-center text-sm font-bold text-[var(--accent)]"
+                onClick={() => setStep("profile")}
+              >
+                New here? Create your player card instead
+              </button>
+            </div>
+          ) : null}
+
+          {step === "profile" ? (
+            <div className="tab-enter">
+              <button
+                type="button"
+                className="mono text-xs font-bold text-[var(--dim)]"
+                onClick={() => setStep("welcome")}
+              >
+                ← Back
+              </button>
+              <p className="mono mt-4 text-[11px] font-bold tracking-[0.18em] text-[var(--accent)] uppercase">
+                Step 2 of 3 · Player card
+              </p>
+              <h1 className="font-display mt-1.5 text-[32px] leading-tight font-black">
+                Build your player card
+              </h1>
+              <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
+                This is the identity the league sees — on the standings,
+                in the duel room, on your trophy shelf.
+              </p>
+
+              {/* Live card preview — real MMR/level, handle as typed */}
+              <div className="glow-teal mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-5">
+                <div className="flex items-center gap-3.5">
+                  <AvatarDisc initials={previewInitials} size={58} accent fontSize={20} />
+                  <div className="min-w-0 flex-1">
+                    <p className="font-display break-words text-xl leading-tight font-black">
+                      {handle.trim() || "Your handle"}
+                    </p>
+                    <p className="mono mt-0.5 text-[11px] text-[var(--dim)]">
+                      {tierOf(mmr)} tier · Level {levelOf(mmr)} · MMR {mmr}
+                      {market ? ` · ${market}` : ""}
+                    </p>
+                  </div>
+                  <span className="mono flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--surface2)] px-3 py-1.5 text-sm font-bold" style={{ boxShadow: "inset 0 0 0 1px var(--border)" }}>
+                    <Icon name="coin" size={15} className="text-[var(--gold)]" />
+                    {data.wallet.balance.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+
+              <form onSubmit={submitSetup} className="mt-5">
+                <label htmlFor="setup-handle" className={labelCls}>
+                  Player handle
+                </label>
+                <input
+                  id="setup-handle"
+                  className={inputCls}
+                  placeholder="e.g. Kass"
+                  maxLength={20}
+                  value={handle}
+                  onChange={(e) => setHandle(e.target.value)}
+                  autoComplete="nickname"
+                />
+                <p className="mt-1.5 text-xs text-[var(--faint)]">
+                  2–20 characters — letters, numbers, spaces, dots, dashes.
+                </p>
+                <label htmlFor="setup-market" className={`${labelCls} mt-4`}>
+                  Home market (optional)
+                </label>
+                <select
+                  id="setup-market"
+                  className={inputCls}
+                  value={market}
+                  onChange={(e) => setMarket(e.target.value)}
+                >
+                  <option value="">Pick your home market…</option>
+                  {HOME_MARKETS.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+
+                <div className="gold-wash mt-5 rounded-[var(--radius)] p-4">
+                  <p className="font-display flex items-center gap-2 font-extrabold">
+                    <Icon name="coin" size={18} className="text-[var(--gold)]" />
+                    500 starter coins — free on signup
+                  </p>
+                  <p className="mt-1 text-sm leading-relaxed text-[var(--dim)]">
+                    League rules (blueprint §2): every new player starts
+                    with 500 coins. Stake them on duel entries — win a
+                    room and the 2× pot lands here. Coins are the
+                    league's score-keeping currency; they have no cash
+                    value.
+                  </p>
+                </div>
+
+                {error ? (
+                  <p role="alert" className="mono mt-4 rounded-2xl border border-[var(--red)] px-3 py-2.5 text-[13px] text-[var(--red)]">
+                    {error}
+                  </p>
+                ) : null}
+                <button
+                  type="submit"
+                  className="mt-4 w-full rounded-full bg-[var(--accent)] py-4 font-display text-base font-black tracking-wide text-[var(--accent-ink)] uppercase disabled:opacity-40"
+                  disabled={completeMut.isPending}
+                >
+                  {completeMut.isPending
+                    ? "Setting up…"
+                    : "Claim starter coins & play"}
+                </button>
+              </form>
+            </div>
+          ) : null}
+
+          {step === "tour" ? (
+            <div className="tab-enter">
+              <p className="mono text-[11px] font-bold tracking-[0.18em] text-[var(--accent)] uppercase">
+                Step 3 of 3 · The quick tour
+              </p>
+              <h1 className="font-display mt-1.5 mb-4 text-[32px] leading-tight font-black">
+                You're in{handle.trim() ? `, ${handle.trim()}` : ""}
+              </h1>
+              <HowItWorks onDone={onFinish} doneLabel="Enter League HQ" />
+            </div>
+          ) : null}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+// ---------- rookie checklist (Home, until the first loop is done) ----------
+// The guided first session after landing on Home: every step is the
+// player's real record, and the card removes itself once the loop —
+// claim, trade, duel, finish — has actually been played.
+
+function RookieChecklist({
+  hasStarter,
+  btcTrades,
+  duelsCreated,
+  duelsFinished,
+  go,
+  onClaim,
+}: {
+  hasStarter: boolean;
+  btcTrades: number;
+  duelsCreated: number;
+  duelsFinished: number;
+  go: (t: TabKey) => void;
+  onClaim: () => void;
+}) {
+  const steps: Array<{
+    label: string;
+    detail: string;
+    done: boolean;
+    cta: string;
+    action: () => void;
+  }> = [
+    {
+      label: "Claim your 500 starter coins",
+      detail: "Your entry money for duel rooms — free, once.",
+      done: hasStarter,
+      cta: "Claim",
+      action: onClaim,
+    },
+    {
+      label: `Record 3 BTC/USD trades (${Math.min(btcTrades, 3)}/3)`,
+      detail: "Duels only score once 3 trades are on your record.",
+      done: btcTrades >= 3,
+      cta: "Trade",
+      action: () => go("trade"),
+    },
+    {
+      label: "Enter your first duel room",
+      detail: "Pick a stakes tier, name a bot rival, escrow your wager.",
+      done: duelsCreated > 0,
+      cta: "Battle",
+      action: () => go("battle"),
+    },
+    {
+      label: "Finish a duel and get scored",
+      detail: "Auto-score reads your real BTC book — highest score takes the pot.",
+      done: duelsFinished > 0,
+      cta: "Battle",
+      action: () => go("battle"),
+    },
+  ];
+  if (steps.every((s) => s.done)) return null;
+  const doneCount = steps.filter((s) => s.done).length;
+  return (
+    <section className="mt-4">
+      <div className={`${cardCls} elev p-4`} style={{ borderColor: "var(--gold-deep)" }}>
+        <p className="font-display flex items-center gap-2 font-extrabold">
+          <Icon name="flame" size={18} className="text-[var(--gold)]" />
+          Rookie checklist
+          <span className="mono ml-auto text-xs font-bold text-[var(--dim)]">
+            {doneCount}/{steps.length}
+          </span>
+        </p>
+        <div className="mt-2 h-2 overflow-hidden rounded-full bg-[var(--surface2)]">
+          <div
+            className="bar-anim h-full rounded-full"
+            style={{ width: `${(doneCount / steps.length) * 100}%`, background: "var(--gold)" }}
+          />
+        </div>
+        <div className="mt-3 space-y-2">
+          {steps.map((s) => (
+            <div key={s.label} className="flex items-center gap-3">
+              <span
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-full"
+                style={{
+                  background: s.done ? "var(--gold)" : "var(--surface2)",
+                  color: s.done ? "var(--accent-ink)" : "var(--faint)",
+                  boxShadow: "inset 0 0 0 1px var(--border)",
+                }}
+                aria-hidden
+              >
+                <Icon name={s.done ? "check" : "lock"} size={13} strokeWidth={2.4} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className={`text-sm font-bold ${s.done ? "text-[var(--dim)] line-through" : ""}`}>
+                  {s.label}
+                </p>
+                <p className="break-words text-xs text-[var(--dim)]">{s.detail}</p>
+              </div>
+              {!s.done ? (
+                <button
+                  type="button"
+                  className="shrink-0 rounded-full bg-[var(--accent)] px-3.5 py-2 font-display text-xs font-black tracking-wide text-[var(--accent-ink)] uppercase"
+                  onClick={s.action}
+                  aria-label={`${s.cta}: ${s.label}`}
+                >
+                  {s.cta}
+                </button>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ---------- 24/7 tournaments board (Battle) ----------
+// Standing cups that run around the clock. In this edition an entry
+// plays out as a duel room against the bot field — the entry button
+// sets the room wager to the cup's entry fee. Full multiplayer
+// brackets ship with the multiplayer build; nothing here pretends a
+// bracket exists.
+
+function TournamentsSection({ onEnter }: { onEnter: (wager: number) => void }) {
+  const cups: Array<{
+    name: string;
+    cadence: string;
+    entry: number;
+    pool: number;
+    note: string;
+    glow: string;
+  }> = [
+    {
+      name: "Rookie Rumble",
+      cadence: "Runs around the clock",
+      entry: 50,
+      pool: 500,
+      note: "The new-player cup — bot field seeded at Bronze/Silver pace.",
+      glow: "glow-teal",
+    },
+    {
+      name: "BTC/USD Cup",
+      cadence: "New field every hour",
+      entry: 100,
+      pool: 1000,
+      note: "The league's headline cup — standard §6 scoring all the way through.",
+      glow: "glow-violet",
+    },
+    {
+      name: "High Roller Open",
+      cadence: "Runs around the clock",
+      entry: 250,
+      pool: 2500,
+      note: "The deep end — Nova and BearTrap pace this field.",
+      glow: "glow-violet",
+    },
+  ];
+  return (
+    <section className="mb-6">
+      <SectionTitle right="the arena never closes">Tournaments · 24/7</SectionTitle>
+      <div className="space-y-3">
+        {cups.map((c) => (
+          <div key={c.name} className={`rounded-[var(--radius)] bg-[var(--surface)] p-4 ${c.glow}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="font-display flex items-center gap-2 text-lg leading-tight font-black">
+                  <Icon name="trophy" size={18} className="shrink-0 text-[var(--gold)]" />
+                  {c.name}
+                </p>
+                <p className="mono mt-1 flex items-center gap-1.5 text-[11px] font-bold tracking-wide text-[var(--accent)] uppercase">
+                  <span className="live-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" aria-hidden />
+                  {c.cadence}
+                </p>
+                <p className="mt-1 text-xs text-[var(--dim)]">{c.note}</p>
+              </div>
+              <div className="shrink-0 text-right">
+                <p className="mono text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Prize pool</p>
+                <p className="mono font-display text-2xl leading-none font-black text-[var(--gold)]">
+                  {c.pool.toLocaleString()}
+                </p>
+                <p className="mono mt-0.5 text-[10px] text-[var(--dim)]">coins · entry {c.entry}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="mt-3 w-full rounded-full bg-[var(--accent)] py-3 font-display text-sm font-black tracking-wide text-[var(--accent-ink)] uppercase"
+              onClick={() => onEnter(c.entry)}
+              aria-label={`Enter ${c.name}: set the duel room wager to its ${c.entry}-coin entry fee`}
+            >
+              Enter cup
+            </button>
+          </div>
+        ))}
+      </div>
+      <p className="mt-2 text-xs text-[var(--dim)]">
+        In this edition a cup entry plays out as a duel room against the bot field — entering
+        sets the room wager to the entry fee below. Full multiplayer brackets arrive with the
+        multiplayer build.
+      </p>
+    </section>
+  );
+}
+
+// ---------- player settings (Profile) ----------
+// The stored player card, editable after setup, plus the welcome-tour
+// replay. A rejected save keeps the typed values and surfaces the
+// server's answer in the app feedback line.
+
+function SettingsSection({
+  profile,
+  setFeedback,
+  refresh,
+  onReplayTour,
+}: {
+  profile: State["profile"];
+  setFeedback: (s: string) => void;
+  refresh: () => void;
+  onReplayTour: () => void;
+}) {
+  const [handle, setHandle] = useState(profile?.handle ?? "");
+  const [market, setMarket] = useState(profile?.home_market ?? "");
+  // If the stored profile changes underneath (e.g. setup finished in
+  // another view), adopt it only while the form is untouched.
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    if (!dirty && profile) {
+      setHandle(profile.handle);
+      setMarket(profile.home_market);
+    }
+  }, [profile, dirty]);
+
+  const saveMut = useMutation({
+    mutationFn: (args: { handle: string; homeMarket: string }) =>
+      api.updateProfile(args),
+    onSuccess: (r) => {
+      setFeedback(r.message);
+      if (r.ok) {
+        setDirty(false);
+        refresh();
+      }
+    },
+    onError: () =>
+      setFeedback("Player card didn't save — your typed values are still in the form; try again."),
+  });
+
+  const onSave = (e: FormEvent) => {
+    e.preventDefault();
+    if (handle.trim().length < 2) {
+      setFeedback("Handle needs at least 2 characters.");
+      return;
+    }
+    saveMut.mutate({ handle: handle.trim(), homeMarket: market });
+  };
+
+  return (
+    <section className="mt-8">
+      <SectionTitle right="stored on your player card">Player settings</SectionTitle>
+      <form onSubmit={onSave} className={`${cardCls} p-4`}>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label htmlFor="settings-handle" className={labelCls}>
+              Player handle
+            </label>
+            <input
+              id="settings-handle"
+              className={inputCls}
+              maxLength={20}
+              value={handle}
+              onChange={(e) => {
+                setHandle(e.target.value);
+                setDirty(true);
+              }}
+              autoComplete="nickname"
+            />
+          </div>
+          <div>
+            <label htmlFor="settings-market" className={labelCls}>
+              Home market
+            </label>
+            <select
+              id="settings-market"
+              className={inputCls}
+              value={market}
+              onChange={(e) => {
+                setMarket(e.target.value);
+                setDirty(true);
+              }}
+            >
+              <option value="">Not set</option>
+              {HOME_MARKETS.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <p className="mt-2 text-xs text-[var(--dim)]">
+          Signed in as {profile?.handle ? profile.handle : "—"} · this edition keeps your
+          player card in the app on this device; Google sign-in ships with the mobile build.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="submit"
+            className={primaryBtn}
+            disabled={saveMut.isPending || !dirty}
+          >
+            {saveMut.isPending ? "Saving…" : "Save player card"}
+          </button>
+          <button type="button" className={ghostBtn} onClick={onReplayTour}>
+            Replay the welcome tour
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
 // ---------- main app ----------
 
 type TabKey = "home" | "battle" | "trade" | "league" | "more";
@@ -908,6 +1911,15 @@ export function App() {
     nonce: number;
   } | null>(null);
   const [wagerReq, setWagerReq] = useState<{ wager: number; nonce: number } | null>(null);
+  // New-player flow: shown until the stored profile says onboarding
+  // is done. flowDone dismisses it the moment the tour's last button
+  // is tapped (the refetch then confirms from the record).
+  const [flowDone, setFlowDone] = useState(false);
+  const [tourOpen, setTourOpen] = useState(false);
+  // Whether the stored profile was already onboarded when this
+  // session first loaded — snapshotted once, so finishing setup
+  // mid-flow doesn't yank the player out before the tour step.
+  const startedOnboarded = useRef<boolean | null>(null);
 
   const state = useQuery({
     queryKey: ["state"],
@@ -960,7 +1972,7 @@ export function App() {
     },
     onError: () =>
       setFeedback(
-        "Live price refresh failed — prices left unchanged. You can still update prices by hand in the Trade tab.",
+        "Live price refresh failed — prices left unchanged (last known price stands).",
       ),
   });
 
@@ -1007,13 +2019,43 @@ export function App() {
     data.signals.length === 0 &&
     data.milestones.length === 0;
 
-  const totalValue = data.positions.reduce(
-    (s, p) => s + p.qty * p.current_price,
-    0,
+  // The player's identity comes from the stored player card; until
+  // setup completes, the new-player flow owns the screen.
+  const displayName = data.profile?.handle?.trim() ? data.profile.handle : "Kass";
+  const myInitials = initialsOf(displayName);
+  if (startedOnboarded.current === null) {
+    startedOnboarded.current = data.profile?.onboarded ?? false;
+  }
+  const onboarded = startedOnboarded.current || flowDone;
+
+  if (!onboarded) {
+    return (
+      <Onboarding
+        data={data}
+        onSetupSaved={(msg) => {
+          setFeedback(msg);
+          refresh();
+        }}
+        onFinish={() => setFlowDone(true)}
+      />
+    );
+  }
+
+  // One-money bankroll (coins only): free coins in the wallet plus the
+  // current coin value of the open BTC position. 1 coin of position
+  // value = qty x BTC price in dollars, numerically — the BTC market
+  // price itself stays in dollars (market data), everything the
+  // player OWNS is counted in coins.
+  const btcPosition = data.positions.find(
+    (p) => p.symbol.toUpperCase() === "BTC",
   );
-  const costBasis = data.positions.reduce((s, p) => s + p.qty * p.avg_cost, 0);
-  const unrealized = totalValue - costBasis;
-  const unrealizedPct = costBasis > 0 ? (unrealized / costBasis) * 100 : 0;
+  const inBtcCoins = btcPosition
+    ? btcPosition.qty * btcPosition.current_price
+    : 0;
+  const coinsIn = btcPosition ? btcPosition.qty * btcPosition.avg_cost : 0;
+  const posPlCoins = inBtcCoins - coinsIn;
+  const posPlPct = coinsIn > 0 ? (posPlCoins / coinsIn) * 100 : 0;
+  const bankrollCoins = data.wallet.balance + inBtcCoins;
   const duelWins = data.duels.filter(
     (d) => d.status === "completed" && d.winner === "you",
   ).length;
@@ -1072,10 +2114,10 @@ export function App() {
         {/* ===== APP BAR ===== */}
         <header className="sticky top-0 z-30 border-b border-[var(--border)] bg-[var(--bg)]">
           <div className="flex h-14 items-center gap-2.5 px-4">
-            <AvatarDisc initials="K" size={38} accent fontSize={15} />
+            <AvatarDisc initials={myInitials} size={38} accent fontSize={15} />
             <div className="min-w-0 flex-1">
               <p className="font-display break-words text-[15px] leading-tight font-extrabold tracking-tight">
-                Kass
+                {displayName}
               </p>
               <p className="mono break-words text-[11px] leading-tight text-[var(--dim)]">
                 {tier} · Level {level} · MMR {data.wallet.mmr}
@@ -1125,18 +2167,26 @@ export function App() {
                   </span>
                 </div>
                 <p className="mono mt-4 text-[11px] font-bold tracking-[0.18em] text-[var(--dim)] uppercase">
-                  Your book value
+                  Your bankroll
                 </p>
                 <h1 className="mono mt-1 text-[42px] leading-none font-bold tracking-tight">
-                  {fmtUsd(totalValue)}
+                  {Math.round(bankrollCoins).toLocaleString()} <span className="text-[22px] text-[var(--gold)]">coins</span>
                 </h1>
-                <p
-                  className="mono mt-2 text-[13px] font-semibold"
-                  style={{ color: unrealized >= 0 ? "var(--gain)" : "var(--loss)" }}
-                >
-                  {unrealized >= 0 ? "+" : "−"}{fmtUsd(Math.abs(unrealized))} ({unrealizedPct >= 0 ? "+" : ""}{unrealizedPct.toFixed(1)}%)
-                  <span className="font-normal text-[var(--dim)]"> all time · paper book</span>
+                <p className="mono mt-2 text-[13px] font-semibold text-[var(--dim)]">
+                  {data.wallet.balance.toLocaleString()} free · {Math.round(inBtcCoins).toLocaleString()} in BTC · started at 500
                 </p>
+                {btcPosition ? (
+                  <p
+                    className="mono mt-1 text-[13px] font-semibold"
+                    style={{ color: posPlCoins >= 0 ? "var(--gain)" : "var(--loss)" }}
+                  >
+                    {posPlCoins >= 0 ? "+" : "−"}{Math.abs(Math.round(posPlCoins)).toLocaleString()} coins ({posPlPct >= 0 ? "+" : ""}{posPlPct.toFixed(1)}%) on your BTC position
+                  </p>
+                ) : (
+                  <p className="mono mt-1 text-[13px] font-semibold text-[var(--dim)]">
+                    No BTC position yet — spend coins in Trade to open one
+                  </p>
+                )}
                 <p className="mt-3 max-w-[320px] text-sm leading-relaxed text-[var(--dim)]">
                   1v1 BTC/USD duels, scored like a sports league. Win rooms, climb the board.
                 </p>
@@ -1162,10 +2212,10 @@ export function App() {
               {/* Player card hero */}
               <div className="elev mt-4 rounded-[var(--radius)] border border-[var(--border-strong)] bg-[var(--surface)] p-5">
                 <div className="flex items-center gap-3.5">
-                  <AvatarDisc initials="K" size={58} accent fontSize={22} />
+                  <AvatarDisc initials={myInitials} size={58} accent fontSize={22} />
                   <div className="min-w-0 flex-1">
                     <p className="font-display break-words text-xl leading-tight font-black">
-                      Kass
+                      {displayName}
                     </p>
                     <p className="mono text-[11px] text-[var(--dim)]">
                       {tier} tier · Level {level} trader
@@ -1195,17 +2245,17 @@ export function App() {
                   </div>
                   <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-1 py-2.5">
                     <p className="mono font-display text-lg leading-none font-extrabold">{data.wallet.balance.toLocaleString()}</p>
-                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">Coins</p>
+                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">Free coins</p>
                   </div>
                   <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-1 py-2.5">
-                    <p className="mono font-display text-lg leading-none font-extrabold" style={{ color: unrealized >= 0 ? "var(--gain)" : "var(--loss)" }}>
-                      {unrealizedPct >= 0 ? "+" : ""}{unrealizedPct.toFixed(1)}%
+                    <p className="mono font-display text-lg leading-none font-extrabold" style={{ color: inBtcCoins > 0 ? "var(--text)" : "var(--dim)" }}>
+                      {Math.round(inBtcCoins).toLocaleString()}
                     </p>
-                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">Book P/L</p>
+                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">In BTC</p>
                   </div>
                 </div>
                 <p className="mono mt-3 text-[11px] text-[var(--dim)]">
-                  Book value {fmtUsd(totalValue)} · unrealized {unrealized >= 0 ? "+" : "−"}{fmtUsd(Math.abs(unrealized))} · win a duel +25 MMR, lose −15
+                  Bankroll {Math.round(bankrollCoins).toLocaleString()} coins = {data.wallet.balance.toLocaleString()} free + {Math.round(inBtcCoins).toLocaleString()} in BTC · win a duel +25 MMR, lose −15
                 </p>
                 <div className="mt-3 grid grid-cols-4 gap-2">
                   <button
@@ -1245,14 +2295,33 @@ export function App() {
                 </div>
               </div>
 
+              <RookieChecklist
+                hasStarter={data.walletTxns.some((t) => t.type === "starter_grant")}
+                btcTrades={btcTrades}
+                duelsCreated={data.duels.length}
+                duelsFinished={completedDuels}
+                go={go}
+                onClaim={() =>
+                  api
+                    .completeOnboarding({
+                      handle: displayName,
+                      homeMarket: data.profile?.home_market ?? "",
+                    })
+                    .then((r) => {
+                      setFeedback(r.message);
+                      refresh();
+                    })
+                }
+              />
+
               {isEmpty ? (
                 <div className="mt-4 rounded-[var(--radius)] border border-[var(--accent)] bg-[var(--surface)] p-4">
-                  <p className="font-display font-bold">Start from your Streamlit prototype</p>
+                  <p className="font-display font-bold">Set up the league</p>
                   <p className="mt-1 text-sm text-[var(--dim)]">
-                    Import the exact snapshot from app.py — the prototype portfolio (BTC tradable;
-                    ETH / KAS stay as legacy holdings), VisualML signals,
-                    the 500-coin starter wallet, and the 8-week build plan. Everything stays
-                    editable afterward.
+                    Load the league's starting state — the 500-coin starter
+                    wallet, the signals board, and the 8-week build plan.
+                    Your book starts clean: 500 coins, 0 BTC, and you open
+                    your first position by spending coins in Trade.
                   </p>
                   <button
                     type="button"
@@ -1260,7 +2329,7 @@ export function App() {
                     disabled={importMut.isPending}
                     onClick={() => importMut.mutate()}
                   >
-                    {importMut.isPending ? "Importing…" : "Import prototype snapshot"}
+                    {importMut.isPending ? "Setting up…" : "Set up the league"}
                   </button>
                 </div>
               ) : null}
@@ -1302,6 +2371,7 @@ export function App() {
           {/* ===== BATTLE TAB — TOURNAMENT LOBBY + LIVE ROOM ===== */}
           {tab === "battle" ? (
             <>
+              <TournamentsSection onEnter={pickTier} />
               <StakesLadder onPick={pickTier} />
               <RulesCard />
               <BattleScreen
@@ -1311,6 +2381,7 @@ export function App() {
                 setFeedback={setFeedback}
                 refresh={refresh}
                 onStartDuel={startDuelFlow}
+                youInitials={myInitials}
               />
               <DuelsSection
                 duels={data.duels}
@@ -1328,6 +2399,7 @@ export function App() {
             <PortfolioSection
               positions={data.positions}
               trades={data.trades}
+              balance={data.wallet.balance}
               setFeedback={setFeedback}
               refresh={refresh}
             />
@@ -1336,7 +2408,7 @@ export function App() {
           {/* ===== LEAGUE TAB — STANDINGS ===== */}
           {tab === "league" ? (
             <>
-              <LeagueSection wins={duelWins} losses={duelLosses} mmr={data.wallet.mmr} duels={data.duels} winRate={winRate} btcTrades={btcTrades} />
+              <LeagueSection wins={duelWins} losses={duelLosses} mmr={data.wallet.mmr} duels={data.duels} winRate={winRate} btcTrades={btcTrades} youInitials={myInitials} />
               <TrophyShelf wins={duelWins} badges={badges} />
               <GameCharts
                 positions={data.positions}
@@ -1352,6 +2424,8 @@ export function App() {
           {tab === "more" ? (
             <>
               <PlayerCard
+                name={displayName}
+                initials={myInitials}
                 mmr={data.wallet.mmr}
                 balance={data.wallet.balance}
                 wins={duelWins}
@@ -1364,6 +2438,12 @@ export function App() {
                   .reduce((s, d) => s + d.wager + d.opponent_escrow, 0)}
                 badges={badges}
                 onChallenge={() => go("battle")}
+              />
+              <SettingsSection
+                profile={data.profile}
+                setFeedback={setFeedback}
+                refresh={refresh}
+                onReplayTour={() => setTourOpen(true)}
               />
               <TrophyShelf wins={duelWins} badges={badges} />
               <WalletSection
@@ -1381,6 +2461,13 @@ export function App() {
           ) : null}
           </div>
         </main>
+
+        {/* ===== WELCOME-TOUR REPLAY OVERLAY ===== */}
+        {tourOpen ? (
+          <div className="absolute inset-0 z-40 overflow-y-auto bg-[var(--bg)] px-4 pt-6 pb-10">
+            <HowItWorks onDone={() => setTourOpen(false)} doneLabel="Back to the game" />
+          </div>
+        ) : null}
 
         {/* ===== BOTTOM TAB BAR ===== */}
         <nav
@@ -1521,13 +2608,14 @@ function RulesCard() {
 
 // ---------- live battle room (VS screen) ----------
 
-function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartDuel }: {
+function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartDuel, youInitials }: {
   duels: State["duels"];
   trades: number;
   positions: State["positions"];
   setFeedback: (s: string) => void;
   refresh: () => void;
   onStartDuel: () => void;
+  youInitials: string;
 }) {
   // Only a genuinely live room (open or active) takes over this screen.
   // A finished or voided duel must never be presented as the live room —
@@ -1566,7 +2654,7 @@ function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartD
             </div>
             <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 sm:gap-4">
               <div className="min-w-0 text-center">
-                <span className="flex justify-center"><AvatarDisc initials="K" size={56} accent fontSize={19} /></span>
+                <span className="flex justify-center"><AvatarDisc initials={youInitials} size={56} accent fontSize={19} /></span>
                 <p className="font-display mt-1 break-words font-black">YOU</p>
                 <p className="mono text-xs text-[var(--dim)]">{trades} trades · {retPct >= 0 ? "+" : ""}{retPct.toFixed(1)}% P/L</p>
                 <p className="mono font-display mt-1 text-4xl font-black text-[var(--accent)]">{featured.your_score != null ? featured.your_score.toFixed(1) : preview.total.toFixed(1)}</p>
@@ -1667,7 +2755,7 @@ function GameCharts({ positions, txns, wins, losses }: {
       <SectionTitle num="02" right="your real numbers, drawn simple">Season charts</SectionTitle>
       <div className="grid gap-4">
         <div className={`min-w-0 ${cardCls} p-4`}>
-          <p className="font-display flex items-center gap-2 font-bold"><Icon name="layers" size={17} className="text-[var(--accent)]" /> Book mix</p>
+          <p className="font-display flex items-center gap-2 font-bold"><Icon name="layers" size={17} className="text-[var(--accent)]" /> Bankroll mix — in coins</p>
           {positions.length === 0 ? <p className="mt-2 text-sm text-[var(--dim)]">No positions yet — your mix appears after your first trade.</p> : (
             <>
               <div className="mt-3 flex h-6 w-full overflow-hidden rounded-full" role="img" aria-label={`Portfolio mix: ${positions.map((p) => `${p.symbol} ${total > 0 ? Math.round((p.qty * p.current_price / total) * 100) : 0}%`).join(", ")}`}>
@@ -1679,7 +2767,7 @@ function GameCharts({ positions, txns, wins, losses }: {
                 {positions.map((p, i) => (
                   <div key={p.id} className="flex items-center justify-between gap-2 text-sm">
                     <span className="flex min-w-0 items-center gap-2"><span className="h-3 w-3 shrink-0 rounded-sm" style={{ background: colors[i % colors.length] }} /><span className="mono font-semibold">{p.symbol}</span></span>
-                    <span className="mono">{fmtUsd(p.qty * p.current_price)} · {total > 0 ? ((p.qty * p.current_price / total) * 100).toFixed(0) : 0}%</span>
+                    <span className="mono">{Math.round(p.qty * p.current_price).toLocaleString()} coins · {total > 0 ? ((p.qty * p.current_price / total) * 100).toFixed(0) : 0}%</span>
                   </div>
                 ))}
               </div>
@@ -1714,17 +2802,18 @@ function GameCharts({ positions, txns, wins, losses }: {
 
 // ---------- league standings: podium, table, compare ----------
 
-function LeagueSection({ wins, losses, mmr, duels, winRate, btcTrades }: {
+function LeagueSection({ wins, losses, mmr, duels, winRate, btcTrades, youInitials }: {
   wins: number;
   losses: number;
   mmr: number;
   duels: State["duels"];
   winRate: number;
   btcTrades: number;
+  youInitials: string;
 }) {
   const rows = [
     ...RIVALS.map((r) => ({ name: r.name, initials: r.initials, mmr: r.mmr, w: Math.round(r.winRate / 4), l: Math.round((100 - r.winRate) / 4), winRate: r.winRate, you: false })),
-    { name: "You", initials: "K", mmr, w: wins, l: losses, winRate, you: true },
+    { name: "You", initials: youInitials, mmr, w: wins, l: losses, winRate, you: true },
   ].sort((a, b) => b.mmr - a.mmr);
   const completed = duels.filter((d) => d.status === "completed").length;
   const [compareName, setCompareName] = useState(RIVALS[0]?.name ?? "Nova");
@@ -1801,7 +2890,7 @@ function LeagueSection({ wins, losses, mmr, duels, winRate, btcTrades }: {
         ))}
       </div>
       <p className="mono mt-2 text-xs text-[var(--dim)]">
-        You're #{yourRank} of {rows.length} in this room. Your row is live from your real duels ({completed} completed). Rival rows are the game's bot league cards — in the shipped app these become real players. From the prototype snapshot: weekly league, rank #7 of 124, prize pool $2,450.
+        You're #{yourRank} of {rows.length} in this room. Your row is live from your real duels ({completed} completed). Rival rows are the game's bot league cards — in the shipped app these become real players.
       </p>
 
       {/* Compare — you vs any rival, stat bars head-to-head */}
@@ -1970,68 +3059,74 @@ function ScoreCalculator({ trades }: { trades: number }) {
   );
 }
 
-// ---------- trading room: BTC/USD hero, your book, trade ticket ----------
+// ---------- trading room: coin trading, market chart, position ----------
+// One-money system: coins are the only money. Buys spend whole coins
+// from the wallet at the live Coinbase price; sells close a coin-value
+// slice of the position and credit coins back. The old prototype
+// "Your book" table (manual price edits, legacy ETH/KAS rows) is gone
+// for good — the purple position card below is THE position display.
 
 function PortfolioSection({
   positions,
   trades,
+  balance,
   setFeedback,
   refresh,
 }: {
   positions: State["positions"];
   trades: State["trades"];
+  balance: number;
   setFeedback: (s: string) => void;
   refresh: () => void;
 }) {
-  // BTC/USD is the only tradable pair in this edition — the ticket is
-  // locked to it (the server enforces the same rule).
-  const symbol = "BTC";
   const [side, setSide] = useState<"buy" | "sell">("buy");
-  const [qty, setQty] = useState("");
-  const [price, setPrice] = useState("");
-  const [note, setNote] = useState("");
-  const [priceEdits, setPriceEdits] = useState<Record<number, string>>({});
+  const [coinPick, setCoinPick] = useState<number>(50);
+  const [customCoins, setCustomCoins] = useState("");
   const [range, setRange] = useState<CandleRange>("24H");
+  const [chartType, setChartType] = useState<ChartType>("candles");
+  const [showEma, setShowEma] = useState(true);
+  const [showRsi, setShowRsi] = useState(true);
+  const [showMacd, setShowMacd] = useState(true);
   const candlesQ = useCandles(range);
   const candles: Candle[] = candlesQ.data?.ok ? candlesQ.data.candles : [];
 
-  const tradeMut = useMutation({
-    mutationFn: (args: {
-      symbol: string;
-      side: "buy" | "sell";
-      qty: number;
-      price: number;
-      note: string;
-    }) => api.addTrade(args),
+  const btcPos = positions.find((p) => p.symbol.toUpperCase() === "BTC");
+  const lastC = candles[candles.length - 1];
+  const livePrice = lastC?.close ?? btcPos?.current_price;
+  const posValueCoins = btcPos && livePrice ? btcPos.qty * livePrice : 0;
+  const posCoinsIn = btcPos ? btcPos.qty * btcPos.avg_cost : 0;
+  const posPl = posValueCoins - posCoinsIn;
+  const posPlPct = posCoinsIn > 0 ? (posPl / posCoinsIn) * 100 : 0;
+
+  const customNum = Number(customCoins);
+  const coinAmount = customCoins.trim() !== "" && Number.isFinite(customNum) && customNum > 0
+    ? Math.floor(customNum)
+    : coinPick;
+  const maxBuy = balance;
+  const maxSell = Math.floor(posValueCoins);
+  const effectiveCoins = side === "buy"
+    ? Math.min(coinAmount, Math.max(maxBuy, 0))
+    : Math.min(coinAmount, Math.max(maxSell, 0));
+  const estBtc = livePrice && effectiveCoins > 0 ? effectiveCoins / livePrice : 0;
+
+  const buyMut = useMutation({
+    mutationFn: (coins: number) => api.buyBtcWithCoins({ coins }),
     onSuccess: (r) => {
       setFeedback(r.message);
-      if (r.ok) {
-        setQty("");
-        setPrice("");
-        setNote("");
-      }
+      if (r.ok) setCustomCoins("");
       refresh();
     },
-    onError: () => setFeedback("Trade failed — check the values and retry."),
+    onError: () => setFeedback("Buy didn't go through — no coins were spent. Try again."),
   });
-
-  const priceMut = useMutation({
-    mutationFn: (args: { positionId: number; currentPrice: number }) =>
-      api.updatePrice(args),
+  const sellMut = useMutation({
+    mutationFn: (args: { coins?: number; closeAll: boolean }) => api.sellBtcForCoins(args),
     onSuccess: (r) => {
       setFeedback(r.message);
+      if (r.ok) setCustomCoins("");
       refresh();
     },
+    onError: () => setFeedback("Sell didn't go through — your position is unchanged. Try again."),
   });
-
-  const deleteMut = useMutation({
-    mutationFn: (id: number) => api.deletePosition({ id }),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      refresh();
-    },
-  });
-
   const livePriceMut = useMutation({
     mutationFn: () => api.refreshPrices({}),
     onSuccess: (r) => {
@@ -2039,284 +3134,214 @@ function PortfolioSection({
       if (r.ok) refresh();
     },
     onError: () =>
-      setFeedback(
-        "Live price refresh failed — prices left unchanged. You can still update prices by hand.",
-      ),
+      setFeedback("Live price refresh failed — prices left unchanged (last known price stands)."),
   });
 
-  const onTrade = (e: FormEvent) => {
-    e.preventDefault();
-    const q = Number(qty);
-    const p = Number(price);
-    if (!(q > 0) || !(p > 0)) {
-      setFeedback("Enter a quantity and price for the BTC/USD trade.");
-      return;
+  const onExecute = () => {
+    if (side === "buy") {
+      if (!(coinAmount > 0)) { setFeedback("Pick how many coins to spend — tap a chip or type an amount."); return; }
+      if (coinAmount > balance) { setFeedback(`You only have ${balance} free coins — coins in BTC or escrowed in a duel can't be spent twice.`); return; }
+      buyMut.mutate(coinAmount);
+    } else {
+      if (!btcPos) { setFeedback("No BTC position to sell yet — buy with coins first."); return; }
+      if (!(coinAmount > 0)) { setFeedback("Pick how many coins' worth of BTC to sell."); return; }
+      if (coinAmount > posValueCoins + 1e-9) { setFeedback(`Your BTC position is only worth ${maxSell} coins right now — pick less, or Close all.`); return; }
+      sellMut.mutate({ coins: coinAmount, closeAll: false });
     }
-    tradeMut.mutate({ symbol, side, qty: q, price: p, note });
   };
 
-  const sorted = [...positions].sort(
-    (a, b) => b.qty * b.current_price - a.qty * a.current_price,
-  );
-  const btcPos = positions.find((p) => p.symbol.toUpperCase() === "BTC");
+  const firstC = candles[0];
+  const chg = firstC && lastC && firstC.open > 0 ? ((lastC.close - firstC.open) / firstC.open) * 100 : null;
+  const hi = candles.length ? Math.max(...candles.map((c) => c.high)) : null;
+  const lo = candles.length ? Math.min(...candles.map((c) => c.low)) : null;
+  const vol = candles.length ? candles.reduce((s, c) => s + c.volume, 0) : null;
+  const scrollToTicket = (s: "buy" | "sell") => {
+    setSide(s);
+    document.getElementById("trade-ticket")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const chips = [10, 25, 50, 100];
 
   return (
     <section>
-      <SectionTitle right="BTC/USD only · more pairs later">
+      <SectionTitle right="BTC/USD only · coins are the money">
         Trading room
       </SectionTitle>
 
-      {/* Market view — big price, real Coinbase candles, range pills */}
-      {(() => {
-        const lastC = candles[candles.length - 1];
-        const firstC = candles[0];
-        const livePrice = lastC?.close ?? btcPos?.current_price;
-        const chg = firstC && lastC && firstC.open > 0 ? ((lastC.close - firstC.open) / firstC.open) * 100 : null;
-        const hi = candles.length ? Math.max(...candles.map((c) => c.high)) : null;
-        const lo = candles.length ? Math.min(...candles.map((c) => c.low)) : null;
-        const vol = candles.length ? candles.reduce((s, c) => s + c.volume, 0) : null;
-        const scrollToTicket = (s: "buy" | "sell") => {
-          setSide(s);
-          document.getElementById("trade-ticket")?.scrollIntoView({ behavior: "smooth", block: "start" });
-        };
-        return (
-          <div className="mb-4 overflow-hidden rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 elev">
-            <div className="flex items-center gap-2">
-              <p className="font-display text-base font-black">BTC · Crypto</p>
-              <span className="mono rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] font-bold tracking-wide text-[var(--accent-ink)] uppercase">sole market</span>
-              <span className="ml-auto flex items-center gap-1.5">
-                <span className="live-dot h-2 w-2 rounded-full bg-[var(--accent)]" aria-hidden />
-                <span className="mono text-[10px] font-bold tracking-widest text-[var(--accent)] uppercase">Live</span>
-              </span>
-            </div>
-            <p className="mono mt-2 text-[46px] leading-none font-bold tracking-tight">
-              {livePrice ? `$${fmtPrice(livePrice)}` : "—"}
-            </p>
-            <p className="mono mt-1.5 text-sm font-semibold" style={{ color: chg != null && chg < 0 ? "var(--red)" : "var(--accent)" }}>
-              {chg != null ? `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}% · ${range}` : "—"}
-              <span className="ml-2 text-[11px] font-normal text-[var(--dim)]">Coinbase · free public API</span>
-            </p>
-            <div className="mt-3">
-              {candles.length >= 2 ? (
-                <CandleChart candles={candles} />
-              ) : (
-                <p className="rounded-2xl bg-[var(--surface2)] px-4 py-6 text-center text-sm text-[var(--dim)]">
-                  {candlesQ.isPending
-                    ? "Loading real BTC candles from Coinbase…"
-                    : `${candlesQ.data?.message ?? "Chart unavailable."} Showing your stored price above.`}
-                </p>
-              )}
-            </div>
-            <div className="mt-3 flex items-center gap-1 rounded-full bg-[var(--surface2)] p-1" role="group" aria-label="Chart range">
-              <span className="flex items-center gap-1.5 px-2.5 text-xs font-bold text-[var(--dim)]">
-                <span className="live-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" aria-hidden /> Live
-              </span>
-              {(["24H", "7D", "1M"] as CandleRange[]).map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  aria-pressed={range === r}
-                  onClick={() => setRange(r)}
-                  className="flex-1 rounded-full py-2 text-sm font-black"
-                  style={range === r ? { background: "var(--accent)", color: "var(--accent-ink)" } : { color: "var(--dim)" }}
-                >
-                  {r}
-                </button>
-              ))}
-              <button
-                type="button"
-                className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-[var(--dim)] disabled:opacity-40"
-                disabled={livePriceMut.isPending}
-                onClick={() => { livePriceMut.mutate(); candlesQ.refetch(); }}
-                aria-label="Refresh live BTC price and chart"
-              >
-                <Icon name="refresh" size={17} strokeWidth={2.2} />
-              </button>
-            </div>
-            <div className="mono mt-3 grid grid-cols-3 gap-2 text-center">
-              <div className="rounded-2xl bg-[var(--surface2)] px-2 py-2.5">
-                <p className="text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">High</p>
-                <p className="mt-0.5 text-[13px] font-bold">{hi ? `$${fmtPrice(hi)}` : "—"}</p>
-              </div>
-              <div className="rounded-2xl bg-[var(--surface2)] px-2 py-2.5">
-                <p className="text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Low</p>
-                <p className="mt-0.5 text-[13px] font-bold">{lo ? `$${fmtPrice(lo)}` : "—"}</p>
-              </div>
-              <div className="rounded-2xl bg-[var(--surface2)] px-2 py-2.5">
-                <p className="text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Volume</p>
-                <p className="mt-0.5 text-[13px] font-bold">{vol ? `${vol.toLocaleString("en-US", { maximumFractionDigits: 0 })} BTC` : "—"}</p>
-              </div>
-            </div>
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              <button type="button" onClick={() => scrollToTicket("sell")} className="rounded-full bg-[var(--surface3)] py-4 font-display text-base font-black tracking-wide text-[var(--red)]" aria-label="Sell BTC — jumps to the trade ticket with Sell selected">
-                Sell
-              </button>
-              <button type="button" onClick={() => scrollToTicket("buy")} className="rounded-full bg-[var(--accent)] py-4 font-display text-base font-black tracking-wide text-[var(--accent-ink)]" aria-label="Buy BTC — jumps to the trade ticket with Buy selected">
-                Buy
-              </button>
-            </div>
-            {/* Position card — deep purple, Robinhood-style stat pairs */}
-            {btcPos ? (
-              <div className="purple-card mt-4 rounded-[var(--radius)] p-5">
-                <p className="font-display text-sm font-black tracking-wide">Your Position</p>
-                <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-4">
-                  <div className="min-w-0">
-                    <p className="mono text-[20px] leading-none font-bold">{fmtQty(btcPos.qty)}</p>
-                    <p className="mt-1 text-xs text-[#c9bdf5]">Quantity (BTC)</p>
-                  </div>
-                  <div className="min-w-0">
-                    <p className="mono text-[20px] leading-none font-bold">{fmtUsd(btcPos.qty * btcPos.current_price)}</p>
-                    <p className="mt-1 text-xs text-[#c9bdf5]">Value</p>
-                  </div>
-                  <div className="min-w-0">
-                    <p className="mono text-[20px] leading-none font-bold">${fmtPrice(btcPos.avg_cost)}</p>
-                    <p className="mt-1 text-xs text-[#c9bdf5]">Average Cost</p>
-                  </div>
-                  <div className="min-w-0">
-                    <p className="mono text-[20px] leading-none font-bold" style={{ color: btcPos.current_price >= btcPos.avg_cost ? "var(--accent)" : "var(--red)" }}>
-                      {btcPos.avg_cost > 0 ? `${(((btcPos.current_price - btcPos.avg_cost) / btcPos.avg_cost) * 100).toFixed(2)}%` : "—"}
-                    </p>
-                    <p className="mt-1 text-xs text-[#c9bdf5]">Total Return %</p>
-                  </div>
-                </div>
-                <div className="mt-4 space-y-2 border-t border-white/15 pt-3 text-sm">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-[#c9bdf5]">Unrealized P/L</span>
-                    <span className="mono font-bold" style={{ color: (btcPos.current_price - btcPos.avg_cost) * btcPos.qty >= 0 ? "var(--accent)" : "var(--red)" }}>
-                      {(btcPos.current_price - btcPos.avg_cost) * btcPos.qty >= 0 ? "+" : "−"}{fmtUsd(Math.abs((btcPos.current_price - btcPos.avg_cost) * btcPos.qty))}
-                    </span>
-                  </div>
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-[#c9bdf5]">Current Price</span>
-                    <span className="mono font-bold">${fmtPrice(btcPos.current_price)}</span>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <p className="mt-4 rounded-2xl bg-[var(--surface2)] px-4 py-3 text-sm text-[var(--dim)]">
-                No BTC position yet — your purple position card appears with your first buy below.
-              </p>
-            )}
-          </div>
-        );
-      })()}
-
-      {/* Your book */}
-      <p className="mb-2 text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">Your book</p>
-      {sorted.length === 0 ? (
-        <p className={`${cardCls} p-4 text-sm text-[var(--dim)]`}>
-          No open positions. Log your first paper trade below — positions use
-          weighted-average cost, per blueprint §5.
-        </p>
-      ) : (
-        <div className={`overflow-hidden ${cardCls}`} style={{ borderRadius: "var(--radius)" }}>
-          {sorted.map((p: Position, i: number) => {
-            const value = p.qty * p.current_price;
-            const pl = (p.current_price - p.avg_cost) * p.qty;
-            const plPct =
-              p.avg_cost > 0
-                ? ((p.current_price - p.avg_cost) / p.avg_cost) * 100
-                : 0;
-            const editVal = priceEdits[p.id] ?? String(p.current_price);
-            const isBtc = p.symbol.toUpperCase() === "BTC";
-            return (
-              <div
-                key={p.id}
-                className={`bg-[var(--surface)] p-4 ${i > 0 ? "border-t border-[var(--border)]" : ""}`}
-              >
-                <div className="flex flex-wrap items-baseline justify-between gap-2">
-                  <p className="font-display text-lg font-bold">
-                    {isBtc ? "BTC/USD" : p.symbol}
-                    {isBtc ? (
-                      <span className="mono ml-2 rounded-full bg-[var(--accent)] px-2 py-0.5 align-middle text-[10px] font-bold text-[var(--accent-ink)] uppercase">
-                        tradable
-                      </span>
-                    ) : (
-                      <span className="mono ml-2 rounded-full bg-[var(--surface2)] px-2 py-0.5 align-middle text-[10px] font-bold text-[var(--dim)] uppercase">
-                        legacy holding
-                      </span>
-                    )}
-                    {p.source === "prototype" ? (
-                      <span className="mono ml-2 text-xs font-normal text-[var(--dim)]">
-                        prototype
-                      </span>
-                    ) : null}
-                  </p>
-                  <p className="mono text-lg font-semibold">{fmtUsd(value)}</p>
-                </div>
-                <p className="mono mt-1 text-sm text-[var(--dim)]">
-                  {fmtQty(p.qty)} @ avg ${fmtPrice(p.avg_cost)} · P/L{" "}
-                  <span
-                    style={{ color: pl >= 0 ? "var(--gain)" : "var(--loss)" }}
-                  >
-                    {pl >= 0 ? "+" : "−"}
-                    {fmtUsd(Math.abs(pl)).slice(0)} ({plPct >= 0 ? "+" : ""}
-                    {plPct.toFixed(1)}%)
-                  </span>
-                </p>
-                {isBtc ? (
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <label
-                      htmlFor={`price-${p.id}`}
-                      className="text-xs font-semibold text-[var(--dim)]"
-                    >
-                      Current price $
-                    </label>
-                    <input
-                      id={`price-${p.id}`}
-                      inputMode="decimal"
-                      className="mono w-32 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-2 py-1.5"
-                      value={editVal}
-                      onChange={(e) =>
-                        setPriceEdits((m) => ({ ...m, [p.id]: e.target.value }))
-                      }
-                    />
-                    <button
-                      type="button"
-                      className={ghostBtn}
-                      disabled={priceMut.isPending}
-                      onClick={() => {
-                        const v = Number(editVal);
-                        if (v > 0)
-                          priceMut.mutate({
-                            positionId: p.id,
-                            currentPrice: v,
-                          });
-                      }}
-                    >
-                      Update price
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove ${p.symbol} position`}
-                      className="px-2 py-2 text-sm font-semibold text-[var(--red)]"
-                      onClick={() => deleteMut.mutate(p.id)}
-                    >
-                      Remove
-                    </button>
-                  </div>
-                ) : (
-                  <p className="mono mt-2 text-xs text-[var(--dim)]">
-                    Legacy holding from the prototype — it stays on the books, but it is not tradable in this BTC/USD-only edition and its price is not refreshed.
-                  </p>
-                )}
-              </div>
-            );
-          })}
+      <div className="mb-4 overflow-hidden rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 elev">
+        <div className="flex items-center gap-2">
+          <p className="font-display text-base font-black">BTC · Crypto</p>
+          <span className="mono rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] font-bold tracking-wide text-[var(--accent-ink)] uppercase">sole market</span>
+          <span className="ml-auto flex items-center gap-1.5">
+            <span className="live-dot h-2 w-2 rounded-full bg-[var(--accent)]" aria-hidden />
+            <span className="mono text-[10px] font-bold tracking-widest text-[var(--accent)] uppercase">Live</span>
+          </span>
         </div>
-      )}
-
-      {/* Trade ticket — the game action panel */}
-      <form
-        id="trade-ticket"
-        onSubmit={onTrade}
-        className={`elev mt-4 scroll-mt-20 ${cardCls} p-4`}
-      >
-        <p className="font-display flex items-center gap-2 font-extrabold">
-          <Icon name="bolt" size={18} className="text-[var(--accent)]" /> Make your move — BTC/USD
+        <p className="mono mt-2 text-[46px] leading-none font-bold tracking-tight">
+          {livePrice ? `$${fmtPrice(livePrice)}` : "—"}
         </p>
-        <p className="mono mt-1 text-xs text-[var(--dim)]">
-          Every trade feeds your duel score (activity + returns). BTC/USD is the only pair on the ticket this season.
+        <p className="mono mt-1.5 text-sm font-semibold" style={{ color: chg != null && chg < 0 ? "var(--red)" : "var(--accent)" }}>
+          {chg != null ? `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}% · ${range}` : "—"}
+          <span className="ml-2 text-[11px] font-normal text-[var(--dim)]">Coinbase · free public API</span>
+        </p>
+
+        {/* Chart-type switch */}
+        <div className="mt-3 flex items-center gap-1 rounded-full bg-[var(--surface2)] p-1" role="group" aria-label="Chart type">
+          {([["candles", "Candles"], ["line", "Line"], ["heikin", "Heikin-Ashi"]] as Array<[ChartType, string]>).map(([t, label]) => (
+            <button
+              key={t}
+              type="button"
+              aria-pressed={chartType === t}
+              onClick={() => setChartType(t)}
+              className="flex-1 rounded-full py-2 text-[13px] font-black"
+              style={chartType === t ? { background: "var(--accent)", color: "var(--accent-ink)" } : { color: "var(--dim)" }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {/* Indicator toggles — exactly 3, all from the real candles */}
+        <div className="mt-2 flex items-center gap-1.5" role="group" aria-label="Chart indicators">
+          <span className="mono mr-0.5 text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Indicators</span>
+          {([
+            ["EMA 20", showEma, setShowEma],
+            ["RSI", showRsi, setShowRsi],
+            ["MACD", showMacd, setShowMacd],
+          ] as Array<[string, boolean, (v: boolean) => void]>).map(([label, on, set]) => (
+            <button
+              key={label}
+              type="button"
+              aria-pressed={on}
+              aria-label={`Toggle ${label} indicator`}
+              onClick={() => set(!on)}
+              className="rounded-full px-3 py-1.5 text-xs font-bold"
+              style={on ? { background: "var(--surface3)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--accent)" } : { background: "var(--surface2)", color: "var(--faint)", boxShadow: "inset 0 0 0 1px var(--border)" }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-3">
+          {candles.length >= 2 ? (
+            <MarketChart candles={candles} chartType={chartType} showEma={showEma} showRsi={showRsi} showMacd={showMacd} />
+          ) : (
+            <p className="rounded-2xl bg-[var(--surface2)] px-4 py-6 text-center text-sm text-[var(--dim)]">
+              {candlesQ.isPending
+                ? "Loading real BTC candles from Coinbase…"
+                : `${candlesQ.data?.message ?? "Chart unavailable."} Showing your stored price above.`}
+            </p>
+          )}
+        </div>
+        <div className="mt-3 flex items-center gap-1 rounded-full bg-[var(--surface2)] p-1" role="group" aria-label="Chart range">
+          <span className="flex items-center gap-1.5 px-2.5 text-xs font-bold text-[var(--dim)]">
+            <span className="live-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" aria-hidden /> Live
+          </span>
+          {(["24H", "7D", "1M"] as CandleRange[]).map((r) => (
+            <button
+              key={r}
+              type="button"
+              aria-pressed={range === r}
+              onClick={() => setRange(r)}
+              className="flex-1 rounded-full py-2 text-sm font-black"
+              style={range === r ? { background: "var(--accent)", color: "var(--accent-ink)" } : { color: "var(--dim)" }}
+            >
+              {r}
+            </button>
+          ))}
+          <button
+            type="button"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-[var(--dim)] disabled:opacity-40"
+            disabled={livePriceMut.isPending}
+            onClick={() => { livePriceMut.mutate(); candlesQ.refetch(); }}
+            aria-label="Refresh live BTC price and chart"
+          >
+            <Icon name="refresh" size={17} strokeWidth={2.2} />
+          </button>
+        </div>
+        <div className="mono mt-3 grid grid-cols-3 gap-2 text-center">
+          <div className="rounded-2xl bg-[var(--surface2)] px-2 py-2.5">
+            <p className="text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">High</p>
+            <p className="mt-0.5 text-[13px] font-bold">{hi ? `$${fmtPrice(hi)}` : "—"}</p>
+          </div>
+          <div className="rounded-2xl bg-[var(--surface2)] px-2 py-2.5">
+            <p className="text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Low</p>
+            <p className="mt-0.5 text-[13px] font-bold">{lo ? `$${fmtPrice(lo)}` : "—"}</p>
+          </div>
+          <div className="rounded-2xl bg-[var(--surface2)] px-2 py-2.5">
+            <p className="text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Volume</p>
+            <p className="mt-0.5 text-[13px] font-bold">{vol ? `${vol.toLocaleString("en-US", { maximumFractionDigits: 0 })} BTC` : "—"}</p>
+          </div>
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-3">
+          <button type="button" onClick={() => scrollToTicket("sell")} className="rounded-full bg-[var(--surface3)] py-4 font-display text-base font-black tracking-wide text-[var(--red)]" aria-label="Sell BTC for coins — jumps to the coin trade panel with Sell selected">
+            Sell
+          </button>
+          <button type="button" onClick={() => scrollToTicket("buy")} className="rounded-full bg-[var(--accent)] py-4 font-display text-base font-black tracking-wide text-[var(--accent-ink)]" aria-label="Buy BTC with coins — jumps to the coin trade panel with Buy selected">
+            Buy
+          </button>
+        </div>
+
+        {/* Position card — IN COINS (the only position display) */}
+        {btcPos ? (
+          <div className="purple-card mt-4 rounded-[var(--radius)] p-5">
+            <p className="font-display text-sm font-black tracking-wide">Your Position — in coins</p>
+            <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-4">
+              <div className="min-w-0">
+                <p className="mono text-[20px] leading-none font-bold">{Math.round(posCoinsIn).toLocaleString()}</p>
+                <p className="mt-1 text-xs text-[#c9bdf5]">Coins in</p>
+              </div>
+              <div className="min-w-0">
+                <p className="mono text-[20px] leading-none font-bold">{Math.round(posValueCoins).toLocaleString()}</p>
+                <p className="mt-1 text-xs text-[#c9bdf5]">Current value (coins)</p>
+              </div>
+              <div className="min-w-0">
+                <p className="mono text-[20px] leading-none font-bold" style={{ color: posPl >= 0 ? "var(--accent)" : "var(--red)" }}>
+                  {posPl >= 0 ? "+" : "−"}{Math.abs(Math.round(posPl)).toLocaleString()}
+                </p>
+                <p className="mt-1 text-xs text-[#c9bdf5]">P/L (coins)</p>
+              </div>
+              <div className="min-w-0">
+                <p className="mono text-[20px] leading-none font-bold" style={{ color: posPl >= 0 ? "var(--accent)" : "var(--red)" }}>
+                  {posPlPct >= 0 ? "+" : ""}{posPlPct.toFixed(2)}%
+                </p>
+                <p className="mt-1 text-xs text-[#c9bdf5]">P/L %</p>
+              </div>
+            </div>
+            <div className="mt-4 space-y-2 border-t border-white/15 pt-3 text-sm">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-[#c9bdf5]">You hold</span>
+                <span className="mono font-bold">{fmtQty(btcPos.qty)} BTC</span>
+              </div>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-[#c9bdf5]">Average entry</span>
+                <span className="mono font-bold">${fmtPrice(btcPos.avg_cost)}</span>
+              </div>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-[#c9bdf5]">Free coins</span>
+                <span className="mono font-bold">{balance.toLocaleString()} coins</span>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 rounded-[var(--radius)] bg-[var(--surface2)] px-4 py-4">
+            <p className="font-display text-sm font-black">No BTC position yet — 0 coins in BTC</p>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              Your bankroll is {balance.toLocaleString()} free coins. Spend coins below to open
+              your first position at the live price — selling credits coins straight back.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Coin trade panel — spend coins to buy, sell back into coins */}
+      <div id="trade-ticket" className={`elev scroll-mt-20 ${cardCls} p-4`}>
+        <p className="font-display flex items-center gap-2 font-extrabold">
+          <Icon name="bolt" size={18} className="text-[var(--accent)]" /> Trade with coins — BTC/USD
+        </p>
+        <p className="mono mt-1 text-xs leading-relaxed text-[var(--dim)]">
+          One wallet for everything: coins buy BTC here and escrow your duel
+          wagers in Battle. Coins sitting in BTC aren't free to wager until
+          you sell. Every trade feeds your duel score.
         </p>
         <div className="mt-3 grid grid-cols-2 gap-1 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] p-1" role="group" aria-label="Trade side">
           <button
@@ -2325,7 +3350,7 @@ function PortfolioSection({
             className={`rounded-[var(--radius)] py-2.5 font-display text-sm font-extrabold tracking-wide ${side === "buy" ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "text-[var(--dim)]"}`}
             onClick={() => setSide("buy")}
           >
-            BUY / LONG
+            BUY WITH COINS
           </button>
           <button
             type="button"
@@ -2333,86 +3358,83 @@ function PortfolioSection({
             className={`rounded-[var(--radius)] py-2.5 font-display text-sm font-extrabold tracking-wide ${side === "sell" ? "bg-[var(--red)] text-white" : "text-[var(--dim)]"}`}
             onClick={() => setSide("sell")}
           >
-            SELL
+            SELL FOR COINS
           </button>
         </div>
-        <select
-          id="trade-side"
-          className="sr-only"
-          value={side}
-          onChange={(e) => setSide(e.target.value as "buy" | "sell")}
-          aria-label="Side"
-          tabIndex={-1}
-        >
-          <option value="buy">Buy</option>
-          <option value="sell">Sell</option>
-        </select>
-        <div className="mt-3 grid grid-cols-2 gap-3">
-          <div>
-            <span className={labelCls} id="trade-pair-label">Pair</span>
-            <div
-              role="img"
-              aria-labelledby="trade-pair-label"
-              aria-label="Pair: BTC/USD, Bitcoin versus US Dollar — the only tradable pair in this edition"
-              className="flex items-center gap-2 rounded-[var(--radius)] border border-[var(--border-strong)] bg-[var(--surface2)] px-3 py-2.5"
+
+        <p className="mono mt-3 text-xs text-[var(--dim)]">
+          {side === "buy"
+            ? `Free coins: ${balance.toLocaleString()} — pick how many to spend`
+            : `Position value: ${Math.round(posValueCoins).toLocaleString()} coins — pick how many coins' worth to sell`}
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-2" role="group" aria-label="Coin amount quick picks">
+          {chips.map((amt) => (
+            <button
+              key={amt}
+              type="button"
+              aria-pressed={customCoins.trim() === "" && coinPick === amt}
+              onClick={() => { setCoinPick(amt); setCustomCoins(""); }}
+              className="rounded-full px-4 py-2 font-display text-sm font-extrabold"
+              style={customCoins.trim() === "" && coinPick === amt
+                ? { background: "var(--accent)", color: "var(--accent-ink)" }
+                : { background: "var(--surface2)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--border)" }}
             >
-              <Icon name="bitcoin" size={18} className="shrink-0 text-[var(--gold)]" />
-              <span className="font-display text-sm font-extrabold">BTC/USD</span>
-              <span className="mono ml-auto text-[10px] font-bold tracking-wide text-[var(--accent)] uppercase">only pair</span>
-            </div>
-          </div>
-          <div>
-            <label htmlFor="trade-qty" className={labelCls}>
-              Quantity (BTC)
-            </label>
-            <input
-              id="trade-qty"
-              inputMode="decimal"
-              className={inputCls}
-              placeholder="0.10"
-              value={qty}
-              onChange={(e) => setQty(e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="trade-price" className={labelCls}>
-              Price $ (per BTC)
-            </label>
-            <input
-              id="trade-price"
-              inputMode="decimal"
-              className={inputCls}
-              placeholder="65000.00"
-              value={price}
-              onChange={(e) => setPrice(e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="trade-note" className={labelCls}>
-              Note (optional)
-            </label>
-            <input
-              id="trade-note"
-              className={inputCls}
-              placeholder="Breakout entry"
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-            />
-          </div>
+              {amt}
+            </button>
+          ))}
+          <button
+            type="button"
+            aria-label={side === "buy" ? "Max: spend all free coins" : "Max: sell the whole position value"}
+            onClick={() => {
+              if (side === "buy") { setCustomCoins(balance > 0 ? String(balance) : ""); }
+              else if (maxSell > 0) { setCustomCoins(String(maxSell)); }
+            }}
+            className="rounded-full px-4 py-2 font-display text-sm font-extrabold"
+            style={{ background: "var(--surface2)", color: "var(--gold)", boxShadow: "inset 0 0 0 1px var(--border)" }}
+          >
+            Max
+          </button>
+          <label className="sr-only" htmlFor="trade-coins-custom">Custom coin amount</label>
+          <input
+            id="trade-coins-custom"
+            inputMode="numeric"
+            className="mono w-28 rounded-full border border-[var(--border)] bg-[var(--surface2)] px-3 py-2"
+            placeholder="Coins"
+            value={customCoins}
+            onChange={(e) => setCustomCoins(e.target.value)}
+          />
         </div>
+        <p className="mono mt-2.5 text-xs text-[var(--dim)]" aria-live="polite">
+          {livePrice
+            ? side === "buy"
+              ? `${coinAmount.toLocaleString()} coins ≈ ${estBtc.toFixed(6)} BTC at $${fmtPrice(livePrice)}`
+              : `${coinAmount.toLocaleString()} coins' worth ≈ ${estBtc.toFixed(6)} BTC at $${fmtPrice(livePrice)}`
+            : "Live price needed to preview — it loads with the chart."}
+        </p>
         <button
-          type="submit"
-          className="mt-4 w-full rounded-[var(--radius)] py-3.5 font-display text-base font-black tracking-wide disabled:opacity-40"
-          style={
-            side === "buy"
-              ? { background: "var(--accent)", color: "var(--accent-ink)" }
-              : { background: "var(--red)", color: "#fff" }
-          }
-          disabled={tradeMut.isPending}
+          type="button"
+          className="mt-3 w-full rounded-[var(--radius)] py-3.5 font-display text-base font-black tracking-wide disabled:opacity-40"
+          style={side === "buy" ? { background: "var(--accent)", color: "var(--accent-ink)" } : { background: "var(--red)", color: "#fff" }}
+          disabled={buyMut.isPending || sellMut.isPending || (side === "buy" ? balance <= 0 : !btcPos)}
+          onClick={onExecute}
         >
-          {side === "buy" ? "EXECUTE BUY" : "EXECUTE SELL"}
+          {side === "buy" ? `BUY BTC — SPEND ${coinAmount.toLocaleString()} COINS` : `SELL — GET ${coinAmount.toLocaleString()} COINS`}
         </button>
-      </form>
+        {side === "sell" && btcPos ? (
+          <button
+            type="button"
+            className="mt-2 w-full rounded-[var(--radius)] border border-[var(--red)] py-3 font-display text-sm font-black tracking-wide text-[var(--red)] disabled:opacity-40"
+            disabled={sellMut.isPending}
+            onClick={() => sellMut.mutate({ closeAll: true })}
+            aria-label="Close all: sell the entire BTC position for its current coin value"
+          >
+            Close all — sell everything ({Math.round(posValueCoins).toLocaleString()} coins)
+          </button>
+        ) : null}
+        {side === "buy" && balance <= 0 ? (
+          <p className="mono mt-2 text-xs text-[var(--dim)]">No free coins right now — sell BTC or win a duel to refill the wallet.</p>
+        ) : null}
+      </div>
 
       {trades.length > 0 ? (
         <div className="mt-4">
@@ -2426,19 +3448,12 @@ function PortfolioSection({
                 className={`flex items-baseline justify-between gap-2 bg-[var(--surface)] px-4 py-2.5 ${i > 0 ? "border-t border-[var(--border)]" : ""}`}
               >
                 <span className="mono text-sm">
-                  <span
-                    className="font-semibold"
-                    style={{
-                      color:
-                        t.side === "buy" ? "var(--gain)" : "var(--loss)",
-                    }}
-                  >
+                  <span className="font-semibold" style={{ color: t.side === "buy" ? "var(--gain)" : "var(--loss)" }}>
                     {t.side.toUpperCase()}
                   </span>{" "}
-                  {fmtQty(t.qty)} {t.symbol.toUpperCase() === "BTC" ? "BTC/USD" : t.symbol} @ ${fmtPrice(t.price)}
-                  {t.note ? (
-                    <span className="text-[var(--dim)]"> · {t.note}</span>
-                  ) : null}
+                  {fmtQty(t.qty)} BTC/USD @ ${fmtPrice(t.price)}
+                  <span className="text-[var(--dim)]"> · {Math.round(t.qty * t.price).toLocaleString()} coins</span>
+                  {t.note ? <span className="text-[var(--dim)]"> · {t.note}</span> : null}
                 </span>
                 <span className="mono text-xs text-[var(--dim)]">
                   {fmtDate(t.created_at)}
@@ -2952,6 +3967,8 @@ function WalletSection({
 // ---------- the collectible player card ----------
 
 function PlayerCard({
+  name,
+  initials,
   mmr,
   balance,
   wins,
@@ -2963,6 +3980,8 @@ function PlayerCard({
   badges,
   onChallenge,
 }: {
+  name: string;
+  initials: string;
   mmr: number;
   balance: number;
   wins: number;
@@ -2989,13 +4008,13 @@ function PlayerCard({
             </span>
           </div>
           <div className="relative mx-auto mt-5 w-fit">
-            <AvatarDisc initials="K" size={104} accent fontSize={40} />
+            <AvatarDisc initials={initials} size={104} accent fontSize={40} />
             <span className="mono absolute -right-2 -bottom-1 grid h-8 w-8 place-items-center rounded-full bg-[var(--accent)] text-[13px] font-black text-[var(--accent-ink)]" style={{ boxShadow: "0 0 14px rgba(198,241,53,0.5)" }} aria-label={`Level ${level}`}>
               {level}
             </span>
           </div>
           <p className="font-display mt-3 text-center text-[30px] leading-none font-black">
-            Kass
+            {name}
           </p>
           <p className="mt-1.5 text-center text-sm font-semibold text-[var(--accent)]">
             {tier} · Level {level}
@@ -3171,7 +4190,7 @@ function SignalsSection({
       >
         <p className="font-display font-bold">Call a signal — BTC/USD</p>
         <p className="mono mt-1 text-xs text-[var(--dim)]">
-          New signals are BTC/USD only in this edition. Prototype signals for other symbols remain on the board above, marked legacy.
+          New signals are BTC/USD only in this edition. Older signals for other symbols remain on the board above, marked legacy.
         </p>
         <div className="mt-3 grid grid-cols-2 gap-3">
           <div>
@@ -3276,9 +4295,9 @@ function ScreensGallery() {
   return (
     <section className="mt-8">
       <SectionTitle num="04" right="the full game, screen by screen">Every screen in the game</SectionTitle>
-      <p className="mb-4 text-sm text-[var(--dim)]">This is the complete screen map for the Paper Trading League, built out to the deploy line and stopping there. In this app the live screens ARE the tabs — League HQ, Battle, Trading Room, Standings, Profile — and this gallery is the designed look of each one, including the splash/sign-in that ships with the mobile build. Swipe sideways through the phones. Nothing deploys until you say deploy.</p>
+      <p className="mb-4 text-sm text-[var(--dim)]">This is the complete screen map for the Paper Trading League, built out to the deploy line and stopping there. In this app the live screens ARE the tabs — League HQ, Battle, Trading Room, Standings, Profile — and this gallery is the designed look of each one, starting with the welcome and sign-in flow that opens the game. Swipe sideways through the phones. Nothing deploys until you say deploy.</p>
       <div className="flex snap-x snap-mandatory gap-4 overflow-x-auto pb-2">
-        <PhoneMock title="1 · Splash & sign-in" status="Preview — sign-in ships with the mobile build; the 500-coin starter grant is live here">
+        <PhoneMock title="1 · Splash & sign-in" status="Live — the welcome, sign-in and player-card setup are this edition's first screens; Google sign-in itself ships with the mobile build">
           <span className="flex justify-center"><Icon name="swords" size={30} className="text-[var(--accent)]" /></span>
           <p className="font-display mt-1 text-center text-sm font-black">PAPER TRADING LEAGUE</p>
           <p className="mono text-center text-[10px] text-[var(--dim)]">DUEL · TRADE BTC/USD · WIN COINS</p>
@@ -3326,19 +4345,19 @@ function ScreensGallery() {
           <p className="mono mt-2 text-center text-[10px]">Pot 200 coins · 30 min · BTC/USD</p>
           <div className="mt-2 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Auto-score finish</div>
         </PhoneMock>
-        <PhoneMock title="5 · Trading room" status="Live — the Trade tab: live Coinbase BTC/USD price, your book, trade ticket">
+        <PhoneMock title="5 · Trading room" status="Live — the Trade tab: live Coinbase BTC/USD price, coin trading, position in coins">
           <p className="font-display text-xs font-bold">BTC/USD · LIVE $76,000</p>
           <div className="mt-2 flex gap-1.5">
-            <span className="flex-1 rounded-full bg-[var(--accent)] py-1 text-center text-[10px] font-bold text-[var(--accent-ink)]">BUY / LONG</span>
+            <span className="flex-1 rounded-full bg-[var(--accent)] py-1 text-center text-[10px] font-bold text-[var(--accent-ink)]">BUY WITH COINS</span>
             <span className="flex-1 rounded-full bg-[var(--surface)] py-1 text-center text-[10px] font-bold">SELL</span>
           </div>
           <div className="mt-2 space-y-1.5">{mockLine("100%")}{mockLine("100%")}{mockLine("55%")}</div>
-          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Execute buy</div>
+          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Buy — spend 50 coins</div>
           <p className="mono mt-2 text-center text-[10px] text-[var(--dim)]">Counts toward your duel score</p>
         </PhoneMock>
-        <PhoneMock title="6 · Season charts" status="Live — League tab charts: book mix, balance line, duel record">
-          <p className="mono text-[10px]">YOUR BOOK</p>
-          <p className="font-display text-base font-extrabold">$50,880</p>
+        <PhoneMock title="6 · Season charts" status="Live — League tab charts: bankroll mix in coins, balance line, duel record">
+          <p className="mono text-[10px]">YOUR BANKROLL</p>
+          <p className="font-display text-base font-extrabold">500 coins</p>
           <div className="mt-2 flex h-3 overflow-hidden rounded-full"><div className="bg-[var(--accent)]" style={{ width: "65%" }} /><div className="bg-[var(--text)]" style={{ width: "26%" }} /><div style={{ width: "9%", background: "var(--gold)" }} /></div>
           <div className="mt-2 space-y-1">{mockLine("90%")}{mockLine("75%")}{mockLine("60%")}</div>
           <svg viewBox="0 0 100 24" className="mt-2 w-full" style={{ height: 28 }} aria-hidden><polyline points="0,20 25,16 50,17 75,8 100,5" fill="none" stroke="var(--accent)" strokeWidth="2" /></svg>
@@ -3380,6 +4399,15 @@ function ScreensGallery() {
             <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">BTC</p><p className="text-[9px]">market</p></div>
           </div>
           <div className="mt-2 flex justify-center gap-2 text-[var(--gold)]"><Icon name="trophy" size={16} /><Icon name="medal" size={16} /><Icon name="lock" size={16} /></div>
+        </PhoneMock>
+        <PhoneMock title="11 · Tournaments" status="Live — the Battle tab's 24/7 cups board; entries play out as duel rooms in this edition">
+          <p className="font-display text-xs font-bold">TOURNAMENTS · 24/7</p>
+          <div className="mt-2 space-y-1.5">
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5"><p className="text-[11px] font-bold">Rookie Rumble</p><p className="mono text-[9px] text-[var(--dim)]">POOL 500 · ENTRY 50</p></div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5"><p className="text-[11px] font-bold">BTC/USD Cup</p><p className="mono text-[9px] text-[var(--dim)]">POOL 1,000 · ENTRY 100</p></div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5"><p className="text-[11px] font-bold">High Roller Open</p><p className="mono text-[9px] text-[var(--dim)]">POOL 2,500 · ENTRY 250</p></div>
+          </div>
+          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Enter cup</div>
         </PhoneMock>
       </div>
     </section>
@@ -3593,11 +4621,11 @@ function BlueprintSection() {
         ))}
       </div>
       <p className="mono mt-3 text-xs text-[var(--dim)]">
-        Source: G-Asisit Production Blueprint V3 + Streamlit prototype
+        Source: G-Asisit Production Blueprint V3 + the Streamlit snapshot
         (app.py) in your project files, and the Paper Trading League design in your Drive
-        (Mac Projects → Trading-League-Game). Prices can be refreshed live from
+        (Mac Projects → Trading-League-Game). Prices refresh live from
         the free Coinbase public API (BTC/USD spot — the only market in this edition; no key,
-        no account, no cost) or entered by hand; the blueprint's named
+        no account, no cost); the blueprint's named
         provider, Polygon.io, is no longer required. Built to the deploy line and stopping
         there: no store submission, no deployment, until you say deploy.
         The remaining literal Week 7/8 work (Expo app, EAS/TestFlight,
