@@ -1,10 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 
 type State = ApiResponse<typeof api, "getState">;
-type Position = State["positions"][number];
 type Duel = State["duels"][number];
 
 // ---------- formatting helpers ----------
@@ -27,6 +26,182 @@ function fmtDate(iso: string): string {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
+}
+
+// Candle timestamps are epoch seconds (Coinbase). Readouts speak
+// Detroit time — Kass's timezone — with a 12-hour clock.
+function fmtDetroitTime(epochSec: number): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Detroit",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(epochSec * 1000));
+}
+
+// ---------- motion helpers (60fps / Bencho / Ripplix craft) ----------
+// One spring family for the whole game: ease-out cubic for entrances,
+// transform + opacity only, and every helper below collapses to an
+// instant swap under prefers-reduced-motion.
+
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState<boolean>(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const onChange = () => setReduced(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return reduced;
+}
+
+// Animated number: rolls from its previous value to the new one
+// (from 0 on first mount) over ~650ms with an ease-out cubic — the
+// odometer treatment, used ONLY for hero / wallet numbers, never
+// for dense rows (those must flash or swap, not count).
+function useAnimatedNumber(value: number, duration = 650): number {
+  const reduced = usePrefersReducedMotion();
+  const [display, setDisplay] = useState(0);
+  const fromRef = useRef(0);
+  useEffect(() => {
+    if (reduced) {
+      fromRef.current = value;
+      setDisplay(value);
+      return;
+    }
+    const from = fromRef.current;
+    if (from === value) {
+      setDisplay(value);
+      return;
+    }
+    let raf = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setDisplay(from + (value - from) * eased);
+      if (t < 1) {
+        raf = requestAnimationFrame(tick);
+      } else {
+        fromRef.current = value;
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [value, reduced, duration]);
+  return display;
+}
+
+function AnimatedNumber({
+  value,
+  format,
+  className,
+}: {
+  value: number;
+  format: (n: number) => string;
+  className?: string;
+}) {
+  const display = useAnimatedNumber(value);
+  return (
+    <span className={className} aria-label={format(value)}>
+      <span aria-hidden>{format(display)}</span>
+    </span>
+  );
+}
+
+// Duel-score reveal: counts 0 → final score once, when it mounts.
+function ScoreCountUp({ value }: { value: number }) {
+  const display = useAnimatedNumber(value, 750);
+  return (
+    <span aria-label={value.toFixed(1)}>
+      <span aria-hidden>{display.toFixed(1)}</span>
+    </span>
+  );
+}
+
+// Sliding-pill segmented control (Bencho / Ripplix pattern): one
+// pill glides behind the labels — transform + width on a damped
+// ease — instead of the active button snapping its colors.
+function SlidingSegmented<T extends string>({
+  options,
+  value,
+  onChange,
+  ariaLabel,
+  pillFor,
+  textFor,
+  rounded = "rounded-full",
+}: {
+  options: Array<[T, string]>;
+  value: T;
+  onChange: (v: T) => void;
+  ariaLabel: string;
+  pillFor: (v: T) => string;
+  textFor: (v: T) => string;
+  rounded?: string;
+}) {
+  const reduced = usePrefersReducedMotion();
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const btnRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const [pill, setPill] = useState<{ x: number; w: number } | null>(null);
+  const activeIdx = options.findIndex(([v]) => v === value);
+
+  useEffect(() => {
+    const measure = () => {
+      const btn = btnRefs.current[activeIdx];
+      if (btn) setPill({ x: btn.offsetLeft, w: btn.offsetWidth });
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [activeIdx, options.length]);
+
+  return (
+    <div
+      ref={wrapRef}
+      className={`relative flex items-center gap-1 bg-[var(--surface2)] p-1 ${rounded}`}
+      role="group"
+      aria-label={ariaLabel}
+    >
+      {pill ? (
+        <span
+          aria-hidden
+          className={`absolute top-1 bottom-1 ${rounded}`}
+          style={{
+            left: 0,
+            width: pill.w,
+            transform: `translateX(${pill.x}px)`,
+            background: pillFor(value),
+            transition: reduced
+              ? "none"
+              : "transform 280ms cubic-bezier(0.32,0.72,0,1), width 280ms cubic-bezier(0.32,0.72,0,1), background-color 200ms ease",
+          }}
+        />
+      ) : null}
+      {options.map(([v, label], i) => (
+        <button
+          key={v}
+          ref={(el) => {
+            btnRefs.current[i] = el;
+          }}
+          type="button"
+          aria-pressed={value === v}
+          onClick={() => onChange(v)}
+          className={`relative z-10 flex-1 py-2 text-[13px] font-black ${rounded}`}
+          style={{
+            color: value === v ? textFor(v) : "var(--dim)",
+            transition: "color 160ms ease, transform 120ms ease-out",
+          }}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 // ---------- scoring engine (blueprint §6) ----------
@@ -81,30 +256,7 @@ function tierOf(mmr: number): string {
   return "Bronze";
 }
 
-// Quests are computed from the player's real record — a quest shows
-// done only when the stored data says so, and its progress bar is the
-// real count over the real target.
-type Quest = { name: string; detail: string; now: number; target: number };
-
-function questsOf(s: {
-  wins: number;
-  completed: number;
-  btcTrades: number;
-  mmr: number;
-  hasBtcPosition: boolean;
-  userSignals: number;
-}): Quest[] {
-  return [
-    { name: "First Blood", detail: "Win your first duel", now: s.wins, target: 1 },
-    { name: "Warm-Up Laps", detail: "Record 3 BTC/USD trades", now: s.btcTrades, target: 3 },
-    { name: "Duelist", detail: "Finish 3 duels, win or lose", now: s.completed, target: 3 },
-    { name: "The Climb", detail: "Reach 1100 MMR", now: Math.max(0, s.mmr - 1000), target: 100 },
-    { name: "Open a Book", detail: "Hold a BTC/USD position", now: s.hasBtcPosition ? 1 : 0, target: 1 },
-    { name: "Signal Caller", detail: "Post a BTC/USD signal of your own", now: s.userSignals, target: 1 },
-  ];
-}
-
-// Badges likewise: earned strictly from the real record; unearned
+// Badges are earned strictly from the player's real record; unearned
 // badges render locked with the requirement named.
 type Badge = { name: string; req: string; earned: boolean };
 
@@ -114,7 +266,7 @@ function badgesOf(s: {
   winRate: number;
   btcTrades: number;
   balance: number;
-  appReady: number;
+  mmr: number;
 }): Badge[] {
   return [
     { name: "First Win", req: "Win a duel", earned: s.wins >= 1 },
@@ -122,12 +274,15 @@ function badgesOf(s: {
     { name: "Active Trader", req: "Record 10 BTC/USD trades", earned: s.btcTrades >= 10 },
     { name: "Veteran", req: "Finish 5 duels", earned: s.completed >= 5 },
     { name: "Coin Baron", req: "Hold 1,000 coins", earned: s.balance >= 1000 },
-    { name: "League Ready", req: "6 of 8 build weeks app-ready", earned: s.appReady >= 6 },
+    { name: "League Ready", req: "Reach 1100 MMR (Gold tier)", earned: s.mmr >= 1100 },
   ];
 }
 
 // ---------- shared bits ----------
 
+// One section pattern app-wide: a small-caps title, at most one
+// caption line, then the block's card. Sections own their top gap
+// (mt-5 / mt-6 on the <section>) so blocks never flow into each other.
 function SectionTitle({
   children,
   right,
@@ -137,12 +292,10 @@ function SectionTitle({
   num?: string;
 }) {
   return (
-    <div className="mb-4 mt-2">
-      <div className="flex items-center gap-2.5">
-        <h2 className="font-display text-[20px] leading-none font-black tracking-tight text-[var(--text)]">
-          {children}
-        </h2>
-      </div>
+    <div className="mb-3">
+      <h2 className="font-display text-[13px] leading-none font-extrabold tracking-[0.16em] text-[var(--text)] uppercase">
+        {children}
+      </h2>
       {right ? (
         <p className="mt-1.5 text-[12px] leading-snug text-[var(--dim)]">{right}</p>
       ) : null}
@@ -512,64 +665,6 @@ const RIVALS: Array<{ name: string; initials: string; style: string; mmr: number
   { name: "HodlQueen", initials: "HQ", style: "Diamond hands", mmr: 905, winRate: 42, tagline: "Never sold. Ever. That's the strategy." },
 ];
 
-// ---------- quests + badges + activity (all from real state) ----------
-
-function QuestsSection({ quests }: { quests: Quest[] }) {
-  return (
-    <section className="mt-8">
-      <SectionTitle num="02" right="progress is your real record">Season quests</SectionTitle>
-      <div className="space-y-2">
-        {quests.map((q) => {
-          const done = q.now >= q.target;
-          const pct = clamp((q.now / q.target) * 100, 0, 100);
-          return (
-            <div
-              key={q.name}
-              className={`${cardCls} flex items-center gap-3 px-4 py-3 ${done ? "" : "opacity-90"}`}
-              style={done ? { borderColor: "var(--gold-deep)" } : undefined}
-            >
-              <span
-                className="grid h-9 w-9 shrink-0 place-items-center rounded-full"
-                style={{
-                  background: done ? "var(--gold)" : "var(--surface2)",
-                  color: done ? "var(--accent-ink)" : "var(--faint)",
-                  boxShadow: "inset 0 0 0 1px var(--border)",
-                }}
-                aria-hidden
-              >
-                <Icon name={done ? "check" : "lock"} size={16} strokeWidth={2.2} />
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="font-display text-sm font-extrabold">
-                  {q.name}
-                  {done ? (
-                    <span className="mono ml-2 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--gold)" }}>
-                      complete
-                    </span>
-                  ) : null}
-                </p>
-                <p className="break-words text-xs text-[var(--dim)]">{q.detail}</p>
-                <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-[var(--surface2)]">
-                  <div
-                    className="bar-anim h-full rounded-full"
-                    style={{
-                      width: `${Math.max(pct, done ? 100 : 3)}%`,
-                      background: done ? "var(--gold)" : "var(--accent)",
-                    }}
-                  />
-                </div>
-              </div>
-              <span className="mono shrink-0 text-xs font-bold text-[var(--dim)]">
-                {Math.min(q.now, q.target)}/{q.target}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 function TrophyShelf({ wins, badges }: { wins: number; badges: Badge[] }) {
   const shelf: Array<{ label: string; need: number }> = [
     { label: "First Cup", need: 1 },
@@ -578,8 +673,8 @@ function TrophyShelf({ wins, badges }: { wins: number; badges: Badge[] }) {
     { label: "Perfect Ten", need: 10 },
   ];
   return (
-    <section className="mt-8">
-      <SectionTitle num="04" right="earned from your record only">Trophy shelf & badges</SectionTitle>
+    <section className="mt-5">
+      <SectionTitle right="earned from your record only">Trophy shelf & badges</SectionTitle>
       <div className="grid grid-cols-4 gap-2">
         {shelf.map((t) => {
           const earned = wins >= t.need;
@@ -680,8 +775,8 @@ function ActivityFeed({ data }: { data: State }) {
   items.sort((a, b) => b.at - a.at);
   const top = items.slice(0, 8);
   return (
-    <section className="mt-8">
-      <SectionTitle num="03" right="straight from your record">League activity</SectionTitle>
+    <section className="mt-5">
+      <SectionTitle right="straight from your record">Activity</SectionTitle>
       {top.length === 0 ? (
         <p className={`${cardCls} p-4 text-sm text-[var(--dim)]`}>
           Quiet arena so far. Your first trade, duel, or coin movement lands here the moment it happens.
@@ -728,31 +823,299 @@ function useCandles(range: CandleRange) {
 function BtcSparkline() {
   const q = useCandles("24H");
   const candles: Candle[] = q.data?.ok ? q.data.candles : [];
+  // Chart scrubbing (60fps pattern): press / drag across the sparkline
+  // and a crosshair snaps to the nearest candle; the readout chip is
+  // clamped inside the chart at both edges; release restores live.
+  const [scrubIdx, setScrubIdx] = useState<number | null>(null);
+  const scrubbingRef = useRef(false);
+
   if (candles.length < 2) {
-    return (
+    return q.isPending ? (
+      <div className="mt-4" role="status" aria-label="Loading live BTC chart">
+        <div className="skeleton h-[74px] rounded-2xl" />
+      </div>
+    ) : (
       <p className="mono mt-4 text-[11px] text-[var(--dim)]">
-        {q.isPending ? "Loading live BTC chart…" : "Live chart unavailable right now — your stored price still stands."}
+        Live chart unavailable right now — your stored price still stands.
       </p>
     );
   }
   const closes = candles.map((c) => c.close);
   const min = Math.min(...closes);
   const max = Math.max(...closes);
+  const yOf = (v: number) => 30 - ((v - min) / Math.max(max - min, 1)) * 26;
   const pts = closes
-    .map((v, i) => `${(i / (closes.length - 1)) * 100},${30 - ((v - min) / Math.max(max - min, 1)) * 26}`)
+    .map((v, i) => `${(i / (closes.length - 1)) * 100},${yOf(v)}`)
     .join(" ");
   const up = closes[closes.length - 1]! >= closes[0]!;
+  const scrubCandle = scrubIdx != null ? candles[scrubIdx] : undefined;
+  const headPrice = scrubCandle ? scrubCandle.close : closes[closes.length - 1]!;
+
+  const idxFromEvent = (e: ReactPointerEvent<HTMLDivElement>): number => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = clamp((e.clientX - rect.left) / Math.max(rect.width, 1), 0, 1);
+    return Math.round(ratio * (candles.length - 1));
+  };
+
   return (
     <div className="mt-4">
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-        <p className="mono min-w-0 text-[11px] font-bold tracking-widest text-[var(--dim)] uppercase">BTC/USD · 24H · Coinbase</p>
+        <p className="mono min-w-0 text-[11px] font-bold tracking-widest text-[var(--dim)] uppercase">
+          {scrubCandle ? `BTC/USD · ${fmtDetroitTime(scrubCandle.t)} ET` : "BTC/USD · 24H · Coinbase"}
+        </p>
         <p className="mono shrink-0 text-sm font-bold whitespace-nowrap" style={{ color: up ? "var(--accent)" : "var(--red)" }}>
-          ${fmtPrice(closes[closes.length - 1]!)}
+          ${fmtPrice(headPrice)}
         </p>
       </div>
-      <svg viewBox="0 0 100 34" className="mt-1.5 w-full" style={{ height: 56 }} preserveAspectRatio="none" role="img" aria-label={`BTC/USD 24 hour line chart, last price ${fmtPrice(closes[closes.length - 1]!)} dollars`}>
-        <polyline points={pts} fill="none" stroke={up ? "var(--accent)" : "var(--red)"} strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
-      </svg>
+      <div
+        className="relative mt-1.5 touch-pan-y select-none"
+        role="img"
+        aria-label={`BTC/USD 24 hour line chart, last price ${fmtPrice(closes[closes.length - 1]!)} dollars. Press and drag to scrub the chart.`}
+        onPointerDown={(e) => {
+          scrubbingRef.current = true;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setScrubIdx(idxFromEvent(e));
+        }}
+        onPointerMove={(e) => {
+          if (scrubbingRef.current) setScrubIdx(idxFromEvent(e));
+        }}
+        onPointerUp={() => {
+          scrubbingRef.current = false;
+          setScrubIdx(null);
+        }}
+        onPointerCancel={() => {
+          scrubbingRef.current = false;
+          setScrubIdx(null);
+        }}
+      >
+        <svg viewBox="0 0 100 34" className="w-full" style={{ height: 56 }} preserveAspectRatio="none" aria-hidden>
+          <polyline points={pts} fill="none" stroke={up ? "var(--accent)" : "var(--red)"} strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
+          {scrubIdx != null ? (
+            <g>
+              <line x1={(scrubIdx / (closes.length - 1)) * 100} x2={(scrubIdx / (closes.length - 1)) * 100} y1={1} y2={33} stroke="var(--text)" strokeWidth="1" vectorEffect="non-scaling-stroke" opacity="0.65" />
+              <circle cx={(scrubIdx / (closes.length - 1)) * 100} cy={yOf(closes[scrubIdx]!)} r="2.6" fill="var(--bg)" stroke={up ? "var(--accent)" : "var(--red)"} strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+            </g>
+          ) : null}
+        </svg>
+        {scrubCandle ? (
+          <span
+            aria-hidden
+            className="mono pointer-events-none absolute -top-1 z-10 -translate-x-1/2 rounded-full bg-[var(--text)] px-2.5 py-1 text-[10px] font-bold whitespace-nowrap text-[var(--ink)]"
+            style={{
+              left: `clamp(74px, ${(scrubIdx! / (closes.length - 1)) * 100}%, calc(100% - 74px))`,
+              boxShadow: "var(--shadow-pop)",
+            }}
+          >
+            {fmtDetroitTime(scrubCandle.t)} · ${fmtPrice(scrubCandle.close)}
+          </span>
+        ) : null}
+      </div>
+      <p className="mono mt-1 text-[10px] text-[var(--faint)]">Hold &amp; drag the chart to scrub</p>
+    </div>
+  );
+}
+
+// ---------- Home hero: YOUR COINS curve (replaces the BTC sparkline) ----------
+// The hero charts the player's own money, not the market: total coins
+// over the last 24H, rebuilt from the player's real record only.
+// Free coins step at wallet-ledger events (starter grant, duel
+// escrows/payouts, coin buys/sells); BTC quantity steps at trade
+// events; between events the open BTC is marked at each real Coinbase
+// candle close — the same candles the Trade chart uses. Before the
+// player's first recorded event inside the window the curve simply
+// starts at that event — no earlier history is drawn. The final point
+// is the hero's live total (free + in-BTC at live spot), exactly.
+function CoinSparkline({
+  data,
+  bankrollCoins,
+}: {
+  data: State;
+  bankrollCoins: number;
+}) {
+  const q = useCandles("24H");
+  const candles: Candle[] = q.data?.ok ? q.data.candles : [];
+  const [scrubIdx, setScrubIdx] = useState<number | null>(null);
+  const scrubbingRef = useRef(false);
+
+  const btcPosition = data.positions.find(
+    (p) => p.symbol.toUpperCase() === "BTC",
+  );
+  const qtyNow = btcPosition ? btcPosition.qty : 0;
+  const freeNow = data.wallet.balance;
+
+  const txnEvents = data.walletTxns
+    .filter((t) => t.amount !== 0)
+    .map((t) => ({ ms: new Date(t.created_at).getTime(), amount: t.amount }));
+  const tradeEvents = data.trades
+    .filter((t) => t.symbol.toUpperCase() === "BTC")
+    .map((t) => ({
+      ms: new Date(t.created_at).getTime(),
+      dq: t.side === "buy" ? t.qty : -t.qty,
+    }));
+  const hasActivity =
+    tradeEvents.length > 0 ||
+    data.walletTxns.some((t) => t.amount !== 0 && t.type !== "starter_grant");
+
+  // Balance / holdings at time x, walked backwards from the live state:
+  // subtract every recorded step that happened after x.
+  const freeAt = (xMs: number) =>
+    freeNow - txnEvents.reduce((s, e) => (e.ms > xMs ? s + e.amount : s), 0);
+  const qtyAt = (xMs: number) =>
+    Math.max(
+      0,
+      qtyNow - tradeEvents.reduce((s, e) => (e.ms > xMs ? s + e.dq : s), 0),
+    );
+
+  type CoinPoint = { t: number; total: number };
+  let points: CoinPoint[] = [];
+  if (candles.length >= 2) {
+    // One point per candle, valued at that candle's close (end of its
+    // hour bucket): ledger/trade steps at their recorded times, open
+    // BTC marked at the close.
+    const raw: CoinPoint[] = candles.map((c) => {
+      const xMs = (c.t + 3600) * 1000 - 1;
+      return { t: c.t, total: freeAt(xMs) + qtyAt(xMs) * c.close };
+    });
+    const allMs = [
+      ...txnEvents.map((e) => e.ms),
+      ...tradeEvents.map((e) => e.ms),
+    ];
+    const firstEver = allMs.length ? Math.min(...allMs) : null;
+    const windowStartMs = candles[0]!.t * 1000;
+    if (firstEver != null && firstEver > windowStartMs) {
+      const kept = raw.filter(
+        (p) => (p.t + 3600) * 1000 - 1 >= firstEver,
+      );
+      const bucket =
+        candles.find(
+          (c) => firstEver >= c.t * 1000 && firstEver < (c.t + 3600) * 1000,
+        ) ?? candles[candles.length - 1]!;
+      points = [
+        {
+          t: Math.floor(firstEver / 1000),
+          total: freeAt(firstEver) + qtyAt(firstEver) * bucket.close,
+        },
+        ...kept,
+      ];
+    } else {
+      points = raw;
+    }
+    // Final point = the hero's live total, exactly.
+    if (points.length > 0) {
+      const lastPt = points[points.length - 1]!;
+      points[points.length - 1] = { t: lastPt.t, total: bankrollCoins };
+    }
+  }
+
+  // A player with no activity yet holds a flat line at their total —
+  // true at every hour of the window, so it needs no market data.
+  if (points.length < 2 && !hasActivity && qtyNow === 0) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    points = Array.from({ length: 24 }, (_, i) => ({
+      t: nowSec - (23 - i) * 3600,
+      total: bankrollCoins,
+    }));
+  }
+
+  if (points.length < 2) {
+    return q.isPending ? (
+      <div className="mt-4" role="status" aria-label="Loading your coin history">
+        <div className="skeleton h-[74px] rounded-2xl" />
+      </div>
+    ) : (
+      <p className="mono mt-4 text-[11px] text-[var(--dim)]">
+        Coin history unavailable right now — your total above is current.
+      </p>
+    );
+  }
+
+  const totals = points.map((p) => p.total);
+  const min = Math.min(...totals);
+  const max = Math.max(...totals);
+  const span = max - min;
+  const yOf = (v: number) =>
+    span === 0 ? 17 : 30 - ((v - min) / span) * 26;
+  const pts = totals
+    .map((v, i) => `${(i / (totals.length - 1)) * 100},${yOf(v)}`)
+    .join(" ");
+  const firstTotal = totals[0]!;
+  const lastTotal = totals[totals.length - 1]!;
+  const change = lastTotal - firstTotal;
+  const pct = firstTotal > 0 ? (change / firstTotal) * 100 : null;
+  const changeText = `${change > 0 ? "+" : change < 0 ? "−" : ""}${Math.abs(Math.round(change)).toLocaleString()} coins${
+    pct != null
+      ? ` (${pct > 0 ? "+" : pct < 0 ? "−" : ""}${Math.abs(pct).toFixed(1)}%)`
+      : ""
+  }`;
+  const lineColor = change < 0 ? "var(--red)" : "var(--accent)";
+  const scrubPoint = scrubIdx != null ? points[scrubIdx] : undefined;
+
+  const idxFromEvent = (e: ReactPointerEvent<HTMLDivElement>): number => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = clamp((e.clientX - rect.left) / Math.max(rect.width, 1), 0, 1);
+    return Math.round(ratio * (points.length - 1));
+  };
+
+  return (
+    <div className="mt-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <p className="mono min-w-0 text-[11px] font-bold tracking-widest text-[var(--dim)] uppercase">
+          {scrubPoint ? `Your coins · ${fmtDetroitTime(scrubPoint.t)} ET` : "Your coins · 24H"}
+        </p>
+        <p className="mono shrink-0 text-sm font-bold whitespace-nowrap" style={{ color: lineColor }}>
+          {scrubPoint
+            ? `${Math.round(scrubPoint.total).toLocaleString()} coins`
+            : changeText}
+        </p>
+      </div>
+      <div
+        className="relative mt-1.5 touch-pan-y select-none"
+        role="img"
+        aria-label={`Your total coins over the last 24 hours: started at ${Math.round(firstTotal).toLocaleString()} coins, now ${Math.round(lastTotal).toLocaleString()} coins (${changeText}). Press and drag to scrub the chart.`}
+        onPointerDown={(e) => {
+          scrubbingRef.current = true;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setScrubIdx(idxFromEvent(e));
+        }}
+        onPointerMove={(e) => {
+          if (scrubbingRef.current) setScrubIdx(idxFromEvent(e));
+        }}
+        onPointerUp={() => {
+          scrubbingRef.current = false;
+          setScrubIdx(null);
+        }}
+        onPointerCancel={() => {
+          scrubbingRef.current = false;
+          setScrubIdx(null);
+        }}
+      >
+        <svg viewBox="0 0 100 34" className="w-full" style={{ height: 56 }} preserveAspectRatio="none" aria-hidden>
+          <polyline points={pts} fill="none" stroke={lineColor} strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
+          {scrubIdx != null && scrubPoint ? (
+            <g>
+              <line x1={(scrubIdx / (points.length - 1)) * 100} x2={(scrubIdx / (points.length - 1)) * 100} y1={1} y2={33} stroke="var(--text)" strokeWidth="1" vectorEffect="non-scaling-stroke" opacity="0.65" />
+              <circle cx={(scrubIdx / (points.length - 1)) * 100} cy={yOf(scrubPoint.total)} r="2.6" fill="var(--bg)" stroke={lineColor} strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+            </g>
+          ) : null}
+        </svg>
+        {scrubPoint ? (
+          <span
+            aria-hidden
+            className="mono pointer-events-none absolute -top-1 z-10 -translate-x-1/2 rounded-full bg-[var(--text)] px-2.5 py-1 text-[10px] font-bold whitespace-nowrap text-[var(--ink)]"
+            style={{
+              left: `clamp(80px, ${(scrubIdx! / (points.length - 1)) * 100}%, calc(100% - 80px))`,
+              boxShadow: "var(--shadow-pop)",
+            }}
+          >
+            {fmtDetroitTime(scrubPoint.t)} · {Math.round(scrubPoint.total).toLocaleString()} coins
+          </span>
+        ) : null}
+      </div>
+      {hasActivity ? (
+        <p className="mono mt-1 text-[10px] text-[var(--faint)]">Hold &amp; drag to scrub your coins</p>
+      ) : (
+        <p className="mono mt-1 text-[10px] text-[var(--faint)]">Your coin history builds as you play.</p>
+      )}
     </div>
   );
 }
@@ -848,13 +1211,24 @@ function MarketChart({
   showEma,
   showRsi,
   showMacd,
+  onScrub,
 }: {
   candles: Candle[];
   chartType: ChartType;
   showEma: boolean;
   showRsi: boolean;
   showMacd: boolean;
+  onScrub?: (c: Candle | null) => void;
 }) {
+  // Scrubbing (Robinhood grammar via 60fps): finger tracks 1:1, the
+  // crosshair snaps to the nearest candle, and the parent swaps its
+  // big price readout in place until release restores the live price.
+  const [scrubIdx, setScrubIdx] = useState<number | null>(null);
+  const scrubbingRef = useRef(false);
+  useEffect(() => {
+    onScrub?.(scrubIdx != null ? (candles[scrubIdx] ?? null) : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrubIdx]);
   const display = chartType === "heikin" ? heikinAshi(candles) : candles;
   const closes = display.map((c) => c.close);
   const ema = emaSeries(closes, 20);
@@ -908,9 +1282,39 @@ function MarketChart({
     .filter(Boolean)
     .join(" ");
 
+  const scrubCandle = scrubIdx != null ? display[scrubIdx] : undefined;
+  const scrubX = scrubIdx != null ? scrubIdx * step + step / 2 : 0;
+
+  const idxFromEvent = (e: ReactPointerEvent<HTMLDivElement>): number => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    // The plot occupies the left PLOT/W of the svg; the gutter is inert.
+    const plotWidth = (rect.width * PLOT) / W;
+    const ratio = clamp((e.clientX - rect.left) / Math.max(plotWidth, 1), 0, 1);
+    return clamp(Math.round(ratio * display.length - 0.5), 0, display.length - 1);
+  };
+
   return (
-    <div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label={`BTC/USD ${typeLabel} chart, high ${fmtPrice(max)}, low ${fmtPrice(min)}, last ${fmtPrice(lastClose)}${emaNow != null && showEma ? `, EMA 20 at ${fmtPrice(emaNow)}` : ""}`}>
+    <div className="chart-enter">
+      <div
+        className="relative touch-pan-y select-none"
+        onPointerDown={(e) => {
+          scrubbingRef.current = true;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setScrubIdx(idxFromEvent(e));
+        }}
+        onPointerMove={(e) => {
+          if (scrubbingRef.current) setScrubIdx(idxFromEvent(e));
+        }}
+        onPointerUp={() => {
+          scrubbingRef.current = false;
+          setScrubIdx(null);
+        }}
+        onPointerCancel={() => {
+          scrubbingRef.current = false;
+          setScrubIdx(null);
+        }}
+      >
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label={`BTC/USD ${typeLabel} chart, high ${fmtPrice(max)}, low ${fmtPrice(min)}, last ${fmtPrice(lastClose)}${emaNow != null && showEma ? `, EMA 20 at ${fmtPrice(emaNow)}` : ""}. Press and drag to scrub.`}>
         {[0.25, 0.5, 0.75].map((f) => (
           <line key={f} x1={0} x2={PLOT} y1={H * f} y2={H * f} stroke="var(--border)" strokeWidth="0.6" strokeDasharray="3 4" />
         ))}
@@ -934,6 +1338,12 @@ function MarketChart({
         {showEma && emaPts ? (
           <polyline points={emaPts} fill="none" stroke="#38bdf8" strokeWidth="1.4" strokeLinejoin="round" opacity="0.9" />
         ) : null}
+        {scrubCandle ? (
+          <g aria-hidden>
+            <line x1={scrubX} x2={scrubX} y1={4} y2={H - 4} stroke="var(--text)" strokeWidth="1" opacity="0.7" />
+            <circle cx={scrubX} cy={y(scrubCandle.close)} r="4.5" fill="var(--bg)" stroke="var(--accent)" strokeWidth="2" />
+          </g>
+        ) : null}
         {/* Dashed last-price level across the plot, tag in the gutter */}
         <line x1={0} x2={W - 2} y1={y(lastClose)} y2={y(lastClose)} stroke="var(--accent)" strokeWidth="1" strokeDasharray="5 4" opacity="0.85" />
         <rect x={PLOT + 3} y={Math.max(0, Math.min(H - 18, y(lastClose) - 9))} width={GUTTER - 5} height={18} rx={5} fill="var(--accent)" />
@@ -941,6 +1351,20 @@ function MarketChart({
           {fmtPrice(lastClose)}
         </text>
       </svg>
+      {scrubCandle ? (
+        <span
+          aria-hidden
+          className="mono pointer-events-none absolute top-0 z-10 -translate-x-1/2 rounded-full bg-[var(--text)] px-2.5 py-1 text-[10px] font-bold whitespace-nowrap text-[var(--ink)]"
+          style={{
+            left: `clamp(78px, ${(scrubX / W) * 100}%, calc(100% - 78px))`,
+            boxShadow: "var(--shadow-pop)",
+          }}
+        >
+          {fmtDetroitTime(scrubCandle.t)} · ${fmtPrice(scrubCandle.close)}
+        </span>
+      ) : null}
+      </div>
+      <p className="mono mt-1 text-[10px] text-[var(--faint)]">Hold &amp; drag the chart to scrub · release to return to live</p>
       <div className="mono mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-[var(--dim)]">
         <span>Last <span className="font-bold text-[var(--text)]">${fmtPrice(lastClose)}</span> · dashed level line, tag in the side gutter</span>
         {showEma ? <span style={{ color: "#38bdf8" }}>— EMA 20 {emaNow != null ? `$${fmtPrice(emaNow)}` : "warming up"}</span> : null}
@@ -986,55 +1410,99 @@ function MarketChart({
   );
 }
 
-// ---------- stakes ladder (room tiers; pot shown is the real 2× pot) ----------
+// ---------- pick a room (Battle) ----------
+// ONE room picker for the whole tab: the standing 24/7 cups and the
+// stakes ladder were two pickers for the same act, so they are one
+// list now. Every room is a duel: wager the entry, the bot rival
+// matches it, pot is the real 2× escrow. Enter sets the wager in
+// the duel creator below (My duels) — name your rival there and open
+// the room. In this edition a cup entry plays out as a duel room
+// against the bot field; full multiplayer brackets ship with the
+// multiplayer build.
 
-function StakesLadder({ onPick }: { onPick: (wager: number) => void }) {
-  const tiers = [
-    { name: "Practice Arena", wager: 50, glow: "glow-violet", note: "Learn the room. Small pot, full scoring." },
-    { name: "Mid Stakes", wager: 100, glow: "glow-teal", note: "The standard league room." },
-    { name: "High Roller", wager: 250, glow: "glow-violet", note: "Biggest pot on the ladder this season." },
+function RoomPicker({ onPick }: { onPick: (wager: number) => void }) {
+  const rooms: Array<{
+    name: string;
+    tag: string;
+    wager: number;
+    note: string;
+    glow: string;
+  }> = [
+    {
+      name: "Rookie Rumble",
+      tag: "Cup · runs 24/7",
+      wager: 50,
+      note: "The new-player cup — learn the room, full scoring, small pot.",
+      glow: "glow-teal",
+    },
+    {
+      name: "BTC/USD Cup",
+      tag: "Cup · new field hourly",
+      wager: 100,
+      note: "The league's headline cup — the standard room, standard stakes.",
+      glow: "glow-violet",
+    },
+    {
+      name: "High Roller Open",
+      tag: "Cup · runs 24/7",
+      wager: 250,
+      note: "The deep end — biggest pot on the board this season.",
+      glow: "glow-violet",
+    },
   ];
   return (
-    <section className="mb-6">
-      <SectionTitle num="01" right="tap a room to set your wager — pot is the real 2× escrow">Stakes ladder</SectionTitle>
+    <section className="mt-5">
+      <SectionTitle right="hosted by the bot rivals · winner takes the pot">Pick a room</SectionTitle>
       <div className="space-y-3">
-        {tiers.map((t) => (
-          <div key={t.name} className={`rounded-[var(--radius)] bg-[var(--surface)] p-4 ${t.glow}`}>
+        {rooms.map((r) => (
+          <div key={r.name} className={`rounded-[var(--radius)] bg-[var(--surface)] p-4 ${r.glow}`}>
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <p className="font-display text-lg leading-tight font-black">{t.name}</p>
-                <p className="mt-0.5 text-xs text-[var(--dim)]">{t.note}</p>
+                <p className="font-display flex items-center gap-2 text-lg leading-tight font-black">
+                  <Icon name="trophy" size={18} className="shrink-0 text-[var(--gold)]" />
+                  {r.name}
+                </p>
+                <p className="mono mt-1 flex items-center gap-1.5 text-[11px] font-bold tracking-wide text-[var(--accent)] uppercase">
+                  <span className="live-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" aria-hidden />
+                  {r.tag}
+                </p>
+                <p className="mt-1 text-xs text-[var(--dim)]">{r.note}</p>
               </div>
               <div className="shrink-0 text-right">
-                <p className="mono text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Prize pool</p>
-                <p className="mono font-display text-2xl leading-none font-black text-[var(--accent)]">{t.wager * 2}</p>
-                <p className="mono mt-0.5 text-[10px] text-[var(--dim)]">coins · entry {t.wager}</p>
+                <p className="mono text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Pot</p>
+                <p className="mono font-display text-2xl leading-none font-black text-[var(--accent)]">
+                  {r.wager * 2}
+                </p>
+                <p className="mono mt-0.5 text-[10px] text-[var(--dim)]">coins · wager {r.wager}</p>
               </div>
             </div>
             <button
               type="button"
-              className="mt-3 w-full rounded-full bg-[var(--accent)] py-3 font-display text-sm font-black tracking-wide text-[var(--accent-ink)] uppercase"
-              onClick={() => onPick(t.wager)}
-              aria-label={`Enter ${t.name}: set wager to ${t.wager} coins in the duel creator`}
+              className="mt-3 w-full rounded-full border border-[var(--border-strong)] bg-[var(--surface2)] py-3 font-display text-sm font-black tracking-wide text-[var(--text)] uppercase"
+              onClick={() => onPick(r.wager)}
+              aria-label={`Enter ${r.name}: set the duel wager to ${r.wager} coins in the creator below`}
             >
-              Enter now
+              Enter — {r.wager} coins
             </button>
           </div>
         ))}
       </div>
       <p className="mt-2 text-xs text-[var(--dim)]">
-        Rooms are hosted by the bot rivals below — pick a tier, then name your rival in the creator. Winner takes the full pot.
+        Entering sets your wager in the creator below — name your rival and open the room.
+        Cup entries play out as duel rooms against the bot field in this edition.
       </p>
     </section>
   );
 }
 
+
+
 // ---------- featured rooms (the bot rivals, presented as duel rooms) ----------
 
 function FeaturedRooms({ onChallenge }: { onChallenge: (name: string) => void }) {
   return (
-    <section className="mt-8">
-      <SectionTitle num="01" right="bot rooms · BTC/USD">Featured rooms</SectionTitle>
+    <section className="mt-5">
+      <SectionTitle right="bot rooms · BTC/USD">Featured rooms</SectionTitle>
       <div className="space-y-2.5">
         {RIVALS.map((r, i) => (
           <div key={r.name} className={`${cardCls} flex items-center gap-3 p-3.5 ${i % 2 === 0 ? "glow-teal" : "glow-violet"}`}>
@@ -1126,7 +1594,7 @@ function HowItWorks({
     {
       icon: "trophy",
       title: "Climb the league",
-      body: "Wins pay the pot plus +25 MMR; losses cost −15. Finish season quests, light up badges, fill the trophy shelf, and chase Nova at the top of the standings. Tournaments and duel rooms run 24/7 — the arena never closes.",
+      body: "Wins pay the pot plus +25 MMR; losses cost −15. Light up badges, fill the trophy shelf, and chase Nova at the top of the standings. Duel rooms and cups run 24/7 — the arena never closes.",
     },
   ];
   const s = steps[step]!;
@@ -1279,7 +1747,7 @@ function Onboarding({
 
   // A truly fresh install has no rows at all: pull the prototype
   // snapshot in once, in the background, so setup lands on a real
-  // league (starter wallet, build plan, signals board).
+  // league (starter wallet and player record).
   const isEmpty =
     data.positions.length === 0 &&
     data.signals.length === 0 &&
@@ -1539,7 +2007,7 @@ function Onboarding({
                     500 starter coins — free on signup
                   </p>
                   <p className="mt-1 text-sm leading-relaxed text-[var(--dim)]">
-                    League rules (blueprint §2): every new player starts
+                    League rules: every new player starts
                     with 500 coins. Stake them on duel entries — win a
                     room and the 2× pot lands here. Coins are the
                     league's score-keeping currency; they have no cash
@@ -1694,93 +2162,6 @@ function RookieChecklist({
   );
 }
 
-// ---------- 24/7 tournaments board (Battle) ----------
-// Standing cups that run around the clock. In this edition an entry
-// plays out as a duel room against the bot field — the entry button
-// sets the room wager to the cup's entry fee. Full multiplayer
-// brackets ship with the multiplayer build; nothing here pretends a
-// bracket exists.
-
-function TournamentsSection({ onEnter }: { onEnter: (wager: number) => void }) {
-  const cups: Array<{
-    name: string;
-    cadence: string;
-    entry: number;
-    pool: number;
-    note: string;
-    glow: string;
-  }> = [
-    {
-      name: "Rookie Rumble",
-      cadence: "Runs around the clock",
-      entry: 50,
-      pool: 500,
-      note: "The new-player cup — bot field seeded at Bronze/Silver pace.",
-      glow: "glow-teal",
-    },
-    {
-      name: "BTC/USD Cup",
-      cadence: "New field every hour",
-      entry: 100,
-      pool: 1000,
-      note: "The league's headline cup — standard §6 scoring all the way through.",
-      glow: "glow-violet",
-    },
-    {
-      name: "High Roller Open",
-      cadence: "Runs around the clock",
-      entry: 250,
-      pool: 2500,
-      note: "The deep end — Nova and BearTrap pace this field.",
-      glow: "glow-violet",
-    },
-  ];
-  return (
-    <section className="mb-6">
-      <SectionTitle right="the arena never closes">Tournaments · 24/7</SectionTitle>
-      <div className="space-y-3">
-        {cups.map((c) => (
-          <div key={c.name} className={`rounded-[var(--radius)] bg-[var(--surface)] p-4 ${c.glow}`}>
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="font-display flex items-center gap-2 text-lg leading-tight font-black">
-                  <Icon name="trophy" size={18} className="shrink-0 text-[var(--gold)]" />
-                  {c.name}
-                </p>
-                <p className="mono mt-1 flex items-center gap-1.5 text-[11px] font-bold tracking-wide text-[var(--accent)] uppercase">
-                  <span className="live-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" aria-hidden />
-                  {c.cadence}
-                </p>
-                <p className="mt-1 text-xs text-[var(--dim)]">{c.note}</p>
-              </div>
-              <div className="shrink-0 text-right">
-                <p className="mono text-[10px] font-bold tracking-widest text-[var(--dim)] uppercase">Prize pool</p>
-                <p className="mono font-display text-2xl leading-none font-black text-[var(--gold)]">
-                  {c.pool.toLocaleString()}
-                </p>
-                <p className="mono mt-0.5 text-[10px] text-[var(--dim)]">coins · entry {c.entry}</p>
-              </div>
-            </div>
-            <button
-              type="button"
-              className="mt-3 w-full rounded-full bg-[var(--accent)] py-3 font-display text-sm font-black tracking-wide text-[var(--accent-ink)] uppercase"
-              onClick={() => onEnter(c.entry)}
-              aria-label={`Enter ${c.name}: set the duel room wager to its ${c.entry}-coin entry fee`}
-            >
-              Enter cup
-            </button>
-          </div>
-        ))}
-      </div>
-      <p className="mt-2 text-xs text-[var(--dim)]">
-        In this edition a cup entry plays out as a duel room against the bot field — entering
-        sets the room wager to the entry fee below. Full multiplayer brackets arrive with the
-        multiplayer build.
-      </p>
-    </section>
-  );
-}
-
 // ---------- player settings (Profile) ----------
 // The stored player card, editable after setup, plus the welcome-tour
 // replay. A rejected save keeps the typed values and surfaces the
@@ -1833,7 +2214,7 @@ function SettingsSection({
   };
 
   return (
-    <section className="mt-8">
+    <section className="mt-5">
       <SectionTitle right="stored on your player card">Player settings</SectionTitle>
       <form onSubmit={onSave} className={`${cardCls} p-4`}>
         <div className="grid grid-cols-2 gap-3">
@@ -1903,6 +2284,23 @@ type TabKey = "home" | "battle" | "trade" | "league" | "more";
 export function App() {
   const queryClient = useQueryClient();
   const [feedback, setFeedback] = useState<string>("");
+  // Spring-in toast for success confirmations (trades, duel finishes);
+  // errors keep using the persistent feedback line above the tabs.
+  const [toast, setToast] = useState<{ id: number; message: string } | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const showToast = (message: string) => {
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    setToast({ id: Date.now(), message });
+    toastTimer.current = window.setTimeout(() => setToast(null), 4200);
+  };
+  // The app bar condenses (shorter, blurred) once the player scrolls.
+  const [scrolled, setScrolled] = useState(false);
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 16);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
   // Mobile-app shell: exactly one tab screen is shown at a time, like
   // a phone app — no long dashboard scroll.
   const [tab, setTab] = useState<TabKey>("home");
@@ -1964,18 +2362,6 @@ export function App() {
     scrollToCreate();
   };
 
-  const liveMut = useMutation({
-    mutationFn: () => api.refreshPrices({}),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      if (r.ok) refresh();
-    },
-    onError: () =>
-      setFeedback(
-        "Live price refresh failed — prices left unchanged (last known price stands).",
-      ),
-  });
-
   const importMut = useMutation({
     mutationFn: () => api.importPrototype({}),
     onSuccess: (r) => {
@@ -1985,11 +2371,23 @@ export function App() {
   });
 
   if (state.isPending) {
+    // Skeleton at the Home layout's exact dimensions — no blank flash,
+    // no layout jump when the real state lands.
     return (
       <div className="min-h-screen bg-[var(--bg)]">
         <SafeAreaTopScrim backgroundColor="var(--bg)" />
-        <main className="px-4 py-16 text-center">
-          <p className="mono text-sm text-[var(--dim)]">Loading the league…</p>
+        <main className="mx-auto w-full max-w-[430px] px-4 pt-4" role="status" aria-label="Loading the league">
+          <div className="flex items-center gap-2.5">
+            <div className="skeleton h-[38px] w-[38px] rounded-full" />
+            <div className="flex-1">
+              <div className="skeleton h-3.5 w-32 rounded-full" />
+              <div className="skeleton mt-1.5 h-3 w-24 rounded-full" />
+            </div>
+            <div className="skeleton h-8 w-20 rounded-full" />
+          </div>
+          <div className="skeleton mt-4 h-56 rounded-[var(--radius)]" />
+          <div className="skeleton mt-4 h-24 rounded-[var(--radius)]" />
+          <div className="skeleton mt-4 h-40 rounded-[var(--radius)]" />
         </main>
       </div>
     );
@@ -2072,37 +2470,24 @@ export function App() {
   const liveDuelCount = data.duels.filter(
     (d) => d.status === "open" || d.status === "active",
   ).length;
-  // Build progress is computed from the milestone records themselves
-  // (their stored status), so the chip can never drift from the data:
-  // app-ready = weeks whose record status is ready or app-scope.
-  const totalWeeks = data.milestones.length;
-  const appReadyCount = data.milestones.filter(
-    (m) => m.status === "ready" || m.status === "app-scope",
-  ).length;
-  const pricesLive = data.milestones.some(
-    (m) => m.week === 8 && m.status === "mixed",
+  // The rookie loop is done when every checklist step is earned;
+  // Home then swaps the checklist for the Featured Rooms block, so
+  // the screen always carries exactly one of the two.
+  const hasStarterGrant = data.walletTxns.some(
+    (t) => t.type === "starter_grant",
   );
-  const deploySteps = data.milestones.filter(
-    (m) => m.status === "deploy-step" || m.status === "mixed",
-  );
-
-  const quests = questsOf({
-    wins: duelWins,
-    completed: completedDuels,
-    btcTrades,
-    mmr: data.wallet.mmr,
-    hasBtcPosition: data.positions.some((p) => p.symbol.toUpperCase() === "BTC"),
-    userSignals: data.signals.filter(
-      (s) => s.source === "user" && s.symbol.toUpperCase() === "BTC",
-    ).length,
-  });
+  const rookieDone =
+    hasStarterGrant &&
+    btcTrades >= 3 &&
+    data.duels.length > 0 &&
+    completedDuels > 0;
   const badges = badgesOf({
     wins: duelWins,
     completed: completedDuels,
     winRate,
     btcTrades,
     balance: data.wallet.balance,
-    appReady: appReadyCount,
+    mmr: data.wallet.mmr,
   });
 
   return (
@@ -2111,10 +2496,23 @@ export function App() {
       {/* Phone column: full-bleed on a phone; on wider screens it sits
           centered at phone width like the app it previews. */}
       <div className="relative mx-auto flex min-h-screen w-full max-w-[430px] flex-col bg-[var(--bg)] sm:border-x sm:border-[var(--border)]">
-        {/* ===== APP BAR ===== */}
-        <header className="sticky top-0 z-30 border-b border-[var(--border)] bg-[var(--bg)]">
-          <div className="flex h-14 items-center gap-2.5 px-4">
-            <AvatarDisc initials={myInitials} size={38} accent fontSize={15} />
+        {/* ===== APP BAR — condenses with a blur backdrop on scroll ===== */}
+        <header
+          className="sticky top-0 z-30 border-b border-[var(--border)]"
+          style={{
+            background: scrolled ? "rgba(5,5,7,0.82)" : "var(--bg)",
+            backdropFilter: scrolled ? "blur(14px)" : "none",
+            WebkitBackdropFilter: scrolled ? "blur(14px)" : "none",
+            transition: "background-color 220ms ease",
+          }}
+        >
+          <div
+            className="flex items-center gap-2.5 px-4"
+            style={{ height: scrolled ? 46 : 56, transition: "height 220ms cubic-bezier(0.32,0.72,0,1)" }}
+          >
+            <span style={{ transform: scrolled ? "scale(0.88)" : "scale(1)", transition: "transform 220ms cubic-bezier(0.32,0.72,0,1)" }}>
+              <AvatarDisc initials={myInitials} size={38} accent fontSize={15} />
+            </span>
             <div className="min-w-0 flex-1">
               <p className="font-display break-words text-[15px] leading-tight font-extrabold tracking-tight">
                 {displayName}
@@ -2125,7 +2523,7 @@ export function App() {
             </div>
             <span className="mono flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--surface2)] px-3 py-1.5 text-sm font-bold" style={{ boxShadow: "inset 0 0 0 1px var(--border)" }}>
               <Icon name="coin" size={15} className="text-[var(--gold)]" />
-              {data.wallet.balance.toLocaleString()}
+              <AnimatedNumber value={data.wallet.balance} format={(n) => Math.round(n).toLocaleString()} />
             </span>
           </div>
           {liveDuelCount > 0 ? (
@@ -2151,7 +2549,7 @@ export function App() {
             </p>
           ) : null}
 
-          <div key={tab} className="tab-enter">
+          <div key={tab} className="tab-enter stagger-in">
           {/* ===== HOME TAB — LEAGUE HQ ===== */}
           {tab === "home" ? (
             <>
@@ -2170,7 +2568,7 @@ export function App() {
                   Your bankroll
                 </p>
                 <h1 className="mono mt-1 text-[42px] leading-none font-bold tracking-tight">
-                  {Math.round(bankrollCoins).toLocaleString()} <span className="text-[22px] text-[var(--gold)]">coins</span>
+                  <AnimatedNumber value={Math.round(bankrollCoins)} format={(n) => Math.round(n).toLocaleString()} /> <span className="text-[22px] text-[var(--gold)]">coins</span>
                 </h1>
                 <p className="mono mt-2 text-[13px] font-semibold text-[var(--dim)]">
                   {data.wallet.balance.toLocaleString()} free · {Math.round(inBtcCoins).toLocaleString()} in BTC · started at 500
@@ -2206,122 +2604,40 @@ export function App() {
                     Trade BTC
                   </button>
                 </div>
-                <BtcSparkline />
+                <CoinSparkline data={data} bankrollCoins={bankrollCoins} />
               </div>
 
-              {/* Player card hero */}
-              <div className="elev mt-4 rounded-[var(--radius)] border border-[var(--border-strong)] bg-[var(--surface)] p-5">
-                <div className="flex items-center gap-3.5">
-                  <AvatarDisc initials={myInitials} size={58} accent fontSize={22} />
-                  <div className="min-w-0 flex-1">
-                    <p className="font-display break-words text-xl leading-tight font-black">
-                      {displayName}
-                    </p>
-                    <p className="mono text-[11px] text-[var(--dim)]">
-                      {tier} tier · Level {level} trader
-                    </p>
-                    <div className="mt-2">
-                      <div className="flex justify-between text-[11px] font-semibold text-[var(--dim)]">
-                        <span>XP to level {level + 1}</span>
-                        <span className="mono">{xpIntoLevel(data.wallet.mmr)}/100</span>
-                      </div>
-                      <div className="mt-1 h-2.5 overflow-hidden rounded-full bg-[var(--surface2)]">
-                        <div
-                          className="bar-anim h-full rounded-full bg-[var(--accent)]"
-                          style={{ width: `${Math.max(xpIntoLevel(data.wallet.mmr), 4)}%` }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                <div className="mt-4 grid grid-cols-4 gap-2 text-center">
-                  <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-1 py-2.5">
-                    <p className="mono font-display text-lg leading-none font-extrabold">{data.wallet.mmr}</p>
-                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">MMR</p>
-                  </div>
-                  <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-1 py-2.5">
-                    <p className="mono font-display text-lg leading-none font-extrabold">{duelWins}–{duelLosses}</p>
-                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">W – L</p>
-                  </div>
-                  <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-1 py-2.5">
-                    <p className="mono font-display text-lg leading-none font-extrabold">{data.wallet.balance.toLocaleString()}</p>
-                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">Free coins</p>
-                  </div>
-                  <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] px-1 py-2.5">
-                    <p className="mono font-display text-lg leading-none font-extrabold" style={{ color: inBtcCoins > 0 ? "var(--text)" : "var(--dim)" }}>
-                      {Math.round(inBtcCoins).toLocaleString()}
-                    </p>
-                    <p className="mt-1 text-[10px] font-bold tracking-wide text-[var(--dim)] uppercase">In BTC</p>
-                  </div>
-                </div>
-                <p className="mono mt-3 text-[11px] text-[var(--dim)]">
-                  Bankroll {Math.round(bankrollCoins).toLocaleString()} coins = {data.wallet.balance.toLocaleString()} free + {Math.round(inBtcCoins).toLocaleString()} in BTC · win a duel +25 MMR, lose −15
-                </p>
-                <div className="mt-3 grid grid-cols-4 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => go("battle")}
-                    className="flex flex-col items-center gap-1.5 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] py-3 text-[11px] font-bold"
-                    aria-label="Quick action: go to Battle tab to duel"
-                  >
-                    <Icon name="swords" size={21} className="text-[var(--accent)]" />Duel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => go("trade")}
-                    className="flex flex-col items-center gap-1.5 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] py-3 text-[11px] font-bold"
-                    aria-label="Quick action: go to Trade tab"
-                  >
-                    <Icon name="chart" size={21} className="text-[var(--accent)]" />Trade
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => liveMut.mutate()}
-                    disabled={liveMut.isPending}
-                    className="flex flex-col items-center gap-1.5 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] py-3 text-[11px] font-bold disabled:opacity-40"
-                    aria-label="Quick action: refresh the live BTC/USD price"
-                  >
-                    <Icon name="refresh" size={21} className="text-[var(--accent)]" />
-                    {liveMut.isPending ? "Fetching" : "BTC price"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => go("league")}
-                    className="flex flex-col items-center gap-1.5 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] py-3 text-[11px] font-bold"
-                    aria-label="Quick action: go to League tab"
-                  >
-                    <Icon name="trophy" size={21} className="text-[var(--gold)]" />League
-                  </button>
-                </div>
-              </div>
-
-              <RookieChecklist
-                hasStarter={data.walletTxns.some((t) => t.type === "starter_grant")}
-                btcTrades={btcTrades}
-                duelsCreated={data.duels.length}
-                duelsFinished={completedDuels}
-                go={go}
-                onClaim={() =>
-                  api
-                    .completeOnboarding({
-                      handle: displayName,
-                      homeMarket: data.profile?.home_market ?? "",
-                    })
-                    .then((r) => {
-                      setFeedback(r.message);
-                      refresh();
-                    })
-                }
-              />
+              {rookieDone ? (
+                <FeaturedRooms onChallenge={challengeRival} />
+              ) : (
+                <RookieChecklist
+                  hasStarter={hasStarterGrant}
+                  btcTrades={btcTrades}
+                  duelsCreated={data.duels.length}
+                  duelsFinished={completedDuels}
+                  go={go}
+                  onClaim={() =>
+                    api
+                      .completeOnboarding({
+                        handle: displayName,
+                        homeMarket: data.profile?.home_market ?? "",
+                      })
+                      .then((r) => {
+                        setFeedback(r.message);
+                        refresh();
+                      })
+                  }
+                />
+              )}
 
               {isEmpty ? (
                 <div className="mt-4 rounded-[var(--radius)] border border-[var(--accent)] bg-[var(--surface)] p-4">
                   <p className="font-display font-bold">Set up the league</p>
                   <p className="mt-1 text-sm text-[var(--dim)]">
                     Load the league's starting state — the 500-coin starter
-                    wallet, the signals board, and the 8-week build plan.
-                    Your book starts clean: 500 coins, 0 BTC, and you open
-                    your first position by spending coins in Trade.
+                    wallet and your player record. Your book starts clean:
+                    500 coins, 0 BTC, and you open your first position by
+                    spending coins in Trade.
                   </p>
                   <button
                     type="button"
@@ -2334,63 +2650,33 @@ export function App() {
                 </div>
               ) : null}
 
-              <FeaturedRooms onChallenge={challengeRival} />
-              <QuestsSection quests={quests} />
               <ActivityFeed data={data} />
-
-              {totalWeeks > 0 ? (
-              <button
-                type="button"
-                onClick={() => go("more")}
-                className="mt-8 flex w-full items-center gap-3 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4 text-left"
-                aria-label={`Build progress: ${appReadyCount} of ${totalWeeks} weeks app-ready${pricesLive ? " plus live prices" : ""} — open Profile tab for the build plan`}
-              >
-                <Icon name="shield" size={24} className="shrink-0 text-[var(--accent)]" />
-                <span className="min-w-0 flex-1">
-                  <span className="font-display block text-sm font-bold">
-                    Build: {appReadyCount} of {totalWeeks} weeks app-ready
-                    {pricesLive ? " · prices live" : ""}
-                  </span>
-                  <span className="block text-xs text-[var(--dim)]">
-                    {deploySteps
-                      .map((m) =>
-                        m.status === "mixed"
-                          ? `Week ${m.week} ${m.label.toLowerCase()}`
-                          : `Week ${m.week} ${m.label}`,
-                      )
-                      .join(" + ")}{" "}
-                    are deploy steps — they wait for your “deploy”
-                  </span>
-                </span>
-                <Icon name="chevron" size={16} className="shrink-0 text-[var(--dim)]" />
-              </button>
-              ) : null}
             </>
           ) : null}
 
           {/* ===== BATTLE TAB — TOURNAMENT LOBBY + LIVE ROOM ===== */}
           {tab === "battle" ? (
             <>
-              <TournamentsSection onEnter={pickTier} />
-              <StakesLadder onPick={pickTier} />
-              <RulesCard />
               <BattleScreen
                 duels={data.duels}
                 trades={btcTrades}
                 positions={data.positions}
                 setFeedback={setFeedback}
+                showToast={showToast}
                 refresh={refresh}
-                onStartDuel={startDuelFlow}
                 youInitials={myInitials}
               />
+              <RoomPicker onPick={pickTier} />
               <DuelsSection
                 duels={data.duels}
                 balance={data.wallet.balance}
                 setFeedback={setFeedback}
+                showToast={showToast}
                 refresh={refresh}
                 challengeReq={challengeReq}
                 wagerReq={wagerReq}
               />
+              <HowDuelsWork />
             </>
           ) : null}
 
@@ -2401,6 +2687,7 @@ export function App() {
               trades={data.trades}
               balance={data.wallet.balance}
               setFeedback={setFeedback}
+              showToast={showToast}
               refresh={refresh}
             />
           ) : null}
@@ -2416,11 +2703,10 @@ export function App() {
                 wins={duelWins}
                 losses={duelLosses}
               />
-              <ScoreCalculator trades={btcTrades} />
             </>
           ) : null}
 
-          {/* ===== PROFILE TAB — PLAYER CARD + BUILD ===== */}
+          {/* ===== PROFILE TAB — PLAYER CARD, SETTINGS, WALLET ===== */}
           {tab === "more" ? (
             <>
               <PlayerCard
@@ -2445,18 +2731,7 @@ export function App() {
                 refresh={refresh}
                 onReplayTour={() => setTourOpen(true)}
               />
-              <TrophyShelf wins={duelWins} badges={badges} />
-              <WalletSection
-                balance={data.wallet.balance}
-                txns={data.walletTxns}
-                setFeedback={setFeedback}
-                refresh={refresh}
-              />
-              <SignalsSection signals={data.signals} setFeedback={setFeedback} refresh={refresh} />
-              <ScreensGallery />
-              <BuildPlanSection milestones={data.milestones} refresh={refresh} />
-              <DeployLineSection milestones={data.milestones} />
-              <BlueprintSection />
+              <WalletSection txns={data.walletTxns} />
             </>
           ) : null}
           </div>
@@ -2466,6 +2741,29 @@ export function App() {
         {tourOpen ? (
           <div className="absolute inset-0 z-40 overflow-y-auto bg-[var(--bg)] px-4 pt-6 pb-10">
             <HowItWorks onDone={() => setTourOpen(false)} doneLabel="Back to the game" />
+          </div>
+        ) : null}
+
+        {/* ===== SUCCESS TOAST — spring-in, auto-dismiss, errors never land here ===== */}
+        {toast ? (
+          <div
+            key={toast.id}
+            role="status"
+            className="toast-in fixed bottom-24 left-1/2 z-50 flex w-[min(398px,calc(100vw-32px))] items-center gap-2.5 rounded-full bg-[var(--surface3)] py-3 pr-5 pl-3"
+            style={{ boxShadow: "0 0 0 1px var(--border-strong), var(--shadow-pop)" }}
+          >
+            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-[var(--accent)] text-[var(--accent-ink)]" aria-hidden>
+              <Icon name="check" size={15} strokeWidth={2.6} />
+            </span>
+            <p className="min-w-0 flex-1 text-sm leading-snug font-semibold break-words">{toast.message}</p>
+            <button
+              type="button"
+              className="shrink-0 rounded-full p-1 text-[var(--dim)]"
+              onClick={() => setToast(null)}
+              aria-label="Dismiss notification"
+            >
+              <Icon name="x" size={14} />
+            </button>
           </div>
         ) : null}
 
@@ -2520,101 +2818,85 @@ export function App() {
   );
 }
 
-// ---------- verified build status (stored on the milestone records) ----------
-// Each milestone row carries its own status + status_note from the
-// server (getState), and the Home chip, the build-plan badges, and the
-// deploy-line list all render from those records — there is no
-// client-side status map that can drift from the data. These helpers
-// only translate a record's status value into a pill label and tone:
-// ready = built & verified here; app-scope = built for this app
-// edition, with the shipped-app limit named in the record's note;
-// deploy-step = deploy only, never badged ready; mixed (Week 8) =
-// prices ready, store submission is a deploy step.
+// ---------- how duels work (Battle, collapsible) ----------
+// The old full rules card, shrunk to a one-line strip: tap to open
+// the scoring weights (the exact blueprint §6 weights the server
+// scores with), the escrow/pot math, and the house rules. The score
+// formula line folded in here is the one useful line from the old
+// Score Lab, which no longer sits on the player surface.
 
-type MilestoneStatus = State["milestones"][number]["status"];
-
-function statusPill(status: MilestoneStatus): string {
-  switch (status) {
-    case "ready":
-      return "Ready";
-    case "app-scope":
-      return "Ready — app scope";
-    case "mixed":
-      return "Prices ready · store = deploy step";
-    case "deploy-step":
-      return "Deploy step";
-  }
-}
-
-function statusTone(status: MilestoneStatus): "ready" | "partial" | "deploy" {
-  switch (status) {
-    case "ready":
-      return "ready";
-    case "app-scope":
-    case "mixed":
-      return "partial";
-    case "deploy-step":
-      return "deploy";
-  }
-}
-
-// ---------- league rules card ----------
-// The scoring weights shown here are the exact blueprint §6 weights
-// the server scores with — the same five components, in the same
-// order, rendered as labeled bars so the rulebook is visible before
-// anyone escrows a coin.
-
-function RulesCard() {
+function HowDuelsWork() {
+  const [open, setOpen] = useState(false);
   const weights = [
-    { key: "R", label: "Returns", w: 40, note: "your BTC/USD P/L, capped at ±50%" },
-    { key: "K", label: "Risk control", w: 25, note: "risk-adjusted return; halved under 3 trades" },
-    { key: "C", label: "Consistency", w: 15, note: "share of positions in profit" },
-    { key: "A", label: "Activity", w: 10, note: "trades placed, up to 10" },
-    { key: "B", label: "Badge bonus", w: 10, note: "winner's bonus" },
+    { key: "R", label: "Returns", w: 40 },
+    { key: "K", label: "Risk control", w: 25 },
+    { key: "C", label: "Consistency", w: 15 },
+    { key: "A", label: "Activity", w: 10 },
+    { key: "B", label: "Badge bonus", w: 10 },
   ];
   return (
-    <section className="mb-6">
-      <div className={`${cardCls} elev p-4`}>
-        <p className="font-display flex items-center gap-2 text-base font-extrabold">
-          <Icon name="shield" size={19} className="text-[var(--accent)]" /> League rules — how a duel is won
-        </p>
-        <p className="mt-1 text-sm text-[var(--dim)]">
-          Scored like a sports league, not a slot machine: five components, weighted. Your score
-          comes from your real BTC/USD book — nothing else counts.
-        </p>
-        <div className="mt-3 space-y-2">
-          {weights.map((x) => (
-            <div key={x.key} className="flex items-center gap-2">
-              <span className="mono w-4 text-xs font-bold text-[var(--accent)]">{x.key}</span>
-              <span className="w-24 shrink-0 text-xs font-bold">{x.label}</span>
-              <div className="h-2.5 min-w-0 flex-1 overflow-hidden rounded-full bg-[var(--surface2)]">
-                <div className="bar-anim h-full rounded-full bg-[var(--accent)]" style={{ width: `${x.w}%` }} />
+    <section className="mt-5">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={`${cardCls} flex w-full items-center gap-2 px-4 py-3.5 text-left`}
+      >
+        <Icon name="shield" size={18} className="shrink-0 text-[var(--accent)]" />
+        <span className="font-display text-sm font-extrabold">How duels work</span>
+        <span className="mono ml-auto text-[11px] text-[var(--dim)]">scoring · escrow · pot</span>
+        <span
+          className="shrink-0 text-[var(--dim)] transition-transform"
+          style={{ transform: open ? "rotate(90deg)" : "none" }}
+          aria-hidden
+        >
+          <Icon name="chevron" size={15} />
+        </span>
+      </button>
+      {open ? (
+        <div className={`${cardCls} mt-2 p-4`}>
+          <p className="text-sm text-[var(--dim)]">
+            Your score comes from your real BTC/USD book — five components, weighted.
+            Nothing else counts.
+          </p>
+          <div className="mt-3 space-y-2">
+            {weights.map((x) => (
+              <div key={x.key} className="flex items-center gap-2">
+                <span className="mono w-4 text-xs font-bold text-[var(--accent)]">{x.key}</span>
+                <span className="w-24 shrink-0 text-xs font-bold">{x.label}</span>
+                <div className="h-2.5 min-w-0 flex-1 overflow-hidden rounded-full bg-[var(--surface2)]">
+                  <div className="bar-anim h-full rounded-full bg-[var(--accent)]" style={{ width: `${x.w}%` }} />
+                </div>
+                <span className="mono w-9 text-right text-xs font-bold">{x.w}%</span>
               </div>
-              <span className="mono w-9 text-right text-xs font-bold">{x.w}%</span>
-              <span className="hidden">{x.note}</span>
-            </div>
-          ))}
+            ))}
+          </div>
+          <p className="mono mt-3 text-[11px] leading-relaxed text-[var(--dim)]">
+            Score = 0.40·R + 0.25·K + 0.15·C + 0.10·A + 0.10·B — the exact
+            weights the server scores live duels with.
+          </p>
+          <ul className="mono mt-2 space-y-1 text-[11px] leading-relaxed text-[var(--dim)]">
+            <li>· Escrow: your wager leaves your wallet when you create the room; the bot rival matches it on accept. Pot = 2× wager, winner takes all.</li>
+            <li>· A duel needs at least 3 trades on your record to auto-score — under 3, it voids and your wager is refunded. Risk control (K) is halved under 3 trades.</li>
+            <li>· House rules: max 5 duels and 60 trades per hour, and a 24h rematch cooldown against the same rival after a finished duel.</li>
+          </ul>
         </div>
-        <ul className="mono mt-3 space-y-1 text-[11px] leading-relaxed text-[var(--dim)]">
-          <li>· R returns ±50% cap · K risk control · C consistency · A activity · B winner bonus — blueprint §6.</li>
-          <li>· Escrow: your wager leaves your wallet when you create the room; the bot rival matches it on accept. Pot = 2× wager, winner takes all.</li>
-          <li>· A duel needs at least 3 trades on your record to auto-score — under 3, it voids and your wager is refunded.</li>
-          <li>· House rules: max 5 duels and 60 trades per hour, and a 24h rematch cooldown against the same rival after a finished duel.</li>
-        </ul>
-      </div>
+      ) : null}
     </section>
   );
 }
 
+
+
 // ---------- live battle room (VS screen) ----------
 
-function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartDuel, youInitials }: {
+function BattleScreen({ duels, trades, positions, setFeedback, showToast, refresh, youInitials }: {
   duels: State["duels"];
   trades: number;
   positions: State["positions"];
   setFeedback: (s: string) => void;
+  showToast: (s: string) => void;
   refresh: () => void;
-  onStartDuel: () => void;
   youInitials: string;
 }) {
   // Only a genuinely live room (open or active) takes over this screen.
@@ -2632,13 +2914,14 @@ function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartD
 
   return (
     <section>
-      <SectionTitle num="01" right="refreshes every 15s">Live room</SectionTitle>
+      <SectionTitle right="refreshes every 15s">Live room</SectionTitle>
       {!featured ? (
-        <div className={`${cardCls} p-5 text-center`}>
-          <Icon name="swords" size={36} className="mx-auto text-[var(--dim)]" />
-          <p className="font-display mt-2 font-bold">The room is empty</p>
-          <p className="mx-auto mt-1 max-w-md text-sm text-[var(--dim)]">Create a duel room below and it takes over this screen — versus header, live score build-up, pot, and the one-tap auto-score finish.</p>
-          <button type="button" className={`${primaryBtn} mt-3`} onClick={onStartDuel}>Create your first room</button>
+        <div className={`${cardCls} flex items-center gap-3 px-4 py-3.5`}>
+          <Icon name="swords" size={20} className="shrink-0 text-[var(--dim)]" />
+          <p className="text-sm text-[var(--dim)]">
+            <span className="font-display font-bold text-[var(--text)]">No duel live.</span>{" "}
+            Pick a room below — when a duel is open or live, it takes over this spot.
+          </p>
         </div>
       ) : (
         <div className="glow-teal overflow-hidden rounded-[var(--radius)] bg-[var(--surface)]">
@@ -2652,23 +2935,22 @@ function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartD
                 BTC/USD · {featured.duration_label}
               </span>
             </div>
-            <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 sm:gap-4">
-              <div className="min-w-0 text-center">
+            <div key={featured.id} className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 sm:gap-4">
+              <div className="vs-you min-w-0 text-center">
                 <span className="flex justify-center"><AvatarDisc initials={youInitials} size={56} accent fontSize={19} /></span>
                 <p className="font-display mt-1 break-words font-black">YOU</p>
                 <p className="mono text-xs text-[var(--dim)]">{trades} trades · {retPct >= 0 ? "+" : ""}{retPct.toFixed(1)}% P/L</p>
-                <p className="mono font-display mt-1 text-4xl font-black text-[var(--accent)]">{featured.your_score != null ? featured.your_score.toFixed(1) : preview.total.toFixed(1)}</p>
+                <p className="mono font-display mt-1 text-4xl font-black text-[var(--accent)]"><ScoreCountUp value={featured.your_score != null ? featured.your_score : preview.total} /></p>
                 <p className="mono text-[11px] text-[var(--dim)]">{featured.your_score != null ? "final score" : "live projected score"}</p>
               </div>
-              <div className="text-center">
+              <div className="vs-pop text-center">
                 <p className="font-display text-3xl font-black sm:text-4xl">VS</p>
-                <p className="mono mt-2 text-xs">Pot<br /><span className="font-display text-xl font-black" style={{ color: "var(--gold)" }}>{featured.wager + featured.opponent_escrow}</span><br />coins</p>
               </div>
-              <div className="min-w-0 text-center">
+              <div className="vs-opp min-w-0 text-center">
                 <span className="flex justify-center"><AvatarDisc initials={RIVALS.find((r) => r.name === featured.opponent)?.initials ?? "BOT"} size={56} fontSize={16} /></span>
                 <p className="font-display mt-1 break-words font-black">{featured.opponent.toUpperCase()}</p>
                 <p className="mono text-xs text-[var(--dim)]">bot rival</p>
-                <p className="mono font-display mt-1 text-4xl font-black" style={{ color: "var(--red)" }}>{featured.opp_score != null ? featured.opp_score.toFixed(1) : "?"}</p>
+                <p className="mono font-display mt-1 text-4xl font-black" style={{ color: "var(--red)" }}>{featured.opp_score != null ? <ScoreCountUp value={featured.opp_score} /> : "?"}</p>
                 <p className="mono text-[11px] text-[var(--dim)]">{featured.opp_score != null ? "final score" : "revealed at the finish"}</p>
               </div>
             </div>
@@ -2706,14 +2988,14 @@ function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartD
               ))}
             </div>
             {featured.status === "open" ? (
-              <p className="mono mt-3 text-xs text-[var(--dim)]">Accept step, exactly as it works here: {featured.opponent} is a bot rival in this single-user app — there is no human invite link. Your {featured.wager} coins are already escrowed from create. Tapping accept records the bot's matched escrow of {featured.wager} coins on the duel and in the coin ledger (bot side — never taken from your wallet), the pot becomes a real {featured.wager * 2}, and the battle goes live.</p>
+              <p className="mono mt-3 text-xs text-[var(--dim)]">Your {featured.wager} coins are escrowed. When {featured.opponent} (bot rival) accepts, it matches {featured.wager} coins on the game side — never from your wallet — and the battle goes live.</p>
             ) : null}
             {featured.status === "open" || featured.status === "active" ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 {featured.status === "open" ? (
                   <button type="button" className={primaryBtn} onClick={() => api.startDuel({ id: featured.id }).then((r) => { setFeedback(r.message); refresh(); })}>{featured.opponent} (bot) accepts &amp; matches escrow</button>
                 ) : null}
-                <button type="button" className={`${primaryBtn} inline-flex items-center gap-1.5`} onClick={() => api.autoCompleteDuel({ id: featured.id }).then((r) => { setFeedback(r.message); refresh(); })}><Icon name="bolt" size={15} strokeWidth={2} /> Auto-score &amp; finish</button>
+                <button type="button" className={`${primaryBtn} inline-flex items-center gap-1.5`} onClick={() => api.autoCompleteDuel({ id: featured.id }).then((r) => { if (r.ok) showToast(r.message); else setFeedback(r.message); refresh(); })}><Icon name="bolt" size={15} strokeWidth={2} /> Auto-score &amp; finish</button>
                 <button type="button" className={ghostBtn} onClick={() => api.voidDuel({ id: featured.id }).then((r) => { setFeedback(r.message); refresh(); })}>Void (refund)</button>
               </div>
             ) : featured.status === "completed" ? (
@@ -2723,7 +3005,6 @@ function BattleScreen({ duels, trades, positions, setFeedback, refresh, onStartD
             ) : (
               <p className="mono mt-3 text-sm text-[var(--dim)]">This duel was voided and the wager refunded.</p>
             )}
-            <p className="mono mt-2 text-[11px] text-[var(--dim)]">Anti-abuse: auto-score needs at least 3 trades on your record, or the duel voids and refunds (blueprint rule).</p>
           </div>
         </div>
       )}
@@ -2751,8 +3032,8 @@ function GameCharts({ positions, txns, wins, losses }: {
   const totalDuels = wins + losses;
 
   return (
-    <section className="mt-8">
-      <SectionTitle num="02" right="your real numbers, drawn simple">Season charts</SectionTitle>
+    <section className="mt-5">
+      <SectionTitle right="your real numbers, drawn simple">Season stats</SectionTitle>
       <div className="grid gap-4">
         <div className={`min-w-0 ${cardCls} p-4`}>
           <p className="font-display flex items-center gap-2 font-bold"><Icon name="layers" size={17} className="text-[var(--accent)]" /> Bankroll mix — in coins</p>
@@ -2902,11 +3183,11 @@ function LeagueSection({ wins, losses, mmr, duels, winRate, btcTrades, youInitia
           <div className="mt-3 flex flex-wrap gap-1.5" role="group" aria-label="Choose a rival to compare against">
             {RIVALS.map((r) => (
               <button
-                key={r.name}
+                key={`${r.name}-${compareName === r.name}`}
                 type="button"
                 aria-pressed={compareName === r.name}
                 onClick={() => setCompareName(r.name)}
-                className="rounded-full px-3 py-1.5 text-xs font-bold"
+                className={`rounded-full px-3 py-1.5 text-xs font-bold ${compareName === r.name ? "chip-pop" : ""}`}
                 style={
                   compareName === r.name
                     ? { background: "var(--accent)", color: "var(--accent-ink)" }
@@ -2945,120 +3226,6 @@ function LeagueSection({ wins, losses, mmr, duels, winRate, btcTrades, youInitia
   );
 }
 
-// ---------- score lab ----------
-
-function ScoreCalculator({ trades }: { trades: number }) {
-  const [returnsPct, setReturnsPct] = useState(12);
-  const [sharpe, setSharpe] = useState(1.2);
-  const [winRate, setWinRate] = useState(60);
-  const [tradeCount, setTradeCount] = useState(Math.max(trades, 6));
-  const [winner, setWinner] = useState(true);
-
-  const { parts, total, kPenalized } = useMemo(
-    () =>
-      computeScore({
-        returnsPct,
-        sharpe,
-        winRate,
-        trades: tradeCount,
-        winner,
-      }),
-    [returnsPct, sharpe, winRate, tradeCount, winner],
-  );
-
-  const slider = (
-    label: string,
-    value: number,
-    set: (n: number) => void,
-    min: number,
-    max: number,
-    step: number,
-    display: string,
-  ) => (
-    <div>
-      <div className="flex items-baseline justify-between">
-        <label
-          htmlFor={`slider-${label}`}
-          className="text-xs font-semibold tracking-wide text-[var(--dim)] uppercase"
-        >
-          {label}
-        </label>
-        <span className="mono text-sm">{display}</span>
-      </div>
-      <input
-        id={`slider-${label}`}
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => set(Number(e.target.value))}
-        className="mt-1 w-full accent-[var(--accent)]"
-      />
-    </div>
-  );
-
-  return (
-    <section className="mt-8">
-      <SectionTitle num="03" right="blueprint §6">Score lab — know your number</SectionTitle>
-      <div className={`grid gap-6 ${cardCls} p-4`}>
-        <div className="space-y-4">
-          {slider("Returns", returnsPct, setReturnsPct, -50, 50, 1, `${returnsPct > 0 ? "+" : ""}${returnsPct}%`)}
-          {slider("Sharpe (risk-adj.)", sharpe, setSharpe, -1, 3, 0.1, sharpe.toFixed(1))}
-          {slider("Win rate", winRate, setWinRate, 0, 100, 1, `${winRate}%`)}
-          {slider("Trades in duel", tradeCount, setTradeCount, 0, 20, 1, `${tradeCount}`)}
-          <label className="flex cursor-pointer items-center gap-2 text-sm font-semibold">
-            <input
-              type="checkbox"
-              checked={winner}
-              onChange={(e) => setWinner(e.target.checked)}
-              className="h-5 w-5 accent-[var(--accent)]"
-            />
-            Won the duel (bonus B)
-          </label>
-          {kPenalized ? (
-            <p className="mono text-xs text-[var(--red)]">
-              K halved — fewer than 3 trades (blueprint penalty).
-            </p>
-          ) : null}
-        </div>
-        <div>
-          <p className="text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">
-            Duel score
-          </p>
-          <p className="mono font-display mt-1 text-5xl font-black text-[var(--accent)]">
-            {total.toFixed(1)}
-          </p>
-          <p className="mono mt-1 text-xs text-[var(--dim)]">
-            Score = 0.40·R + 0.25·K + 0.15·C + 0.10·A + 0.10·B
-          </p>
-          <div className="mt-4 space-y-2.5">
-            {parts.map((p) => (
-              <div key={p.key} className="flex items-center gap-2">
-                <span className="mono w-6 text-sm font-semibold">{p.key}</span>
-                <div className="h-3 flex-1 overflow-hidden rounded-sm bg-[var(--surface2)]">
-                  <div
-                    className="bar-anim h-full bg-[var(--accent)]"
-                    style={{ width: `${clamp(p.raw, 0, 100)}%` }}
-                  />
-                </div>
-                <span className="mono w-20 text-right text-xs text-[var(--dim)]">
-                  {p.raw.toFixed(0)} × {p.weight.toFixed(2)} ={" "}
-                  {(p.raw * p.weight).toFixed(1)}
-                </span>
-              </div>
-            ))}
-          </div>
-          <p className="mt-3 text-xs text-[var(--dim)]">
-            This lab is a sandbox — slide the inputs to feel the formula. Live duels are scored
-            server-side from your actual record with these exact weights.
-          </p>
-        </div>
-      </div>
-    </section>
-  );
-}
-
 // ---------- trading room: coin trading, market chart, position ----------
 // One-money system: coins are the only money. Buys spend whole coins
 // from the wallet at the live Coinbase price; sells close a coin-value
@@ -3071,14 +3238,19 @@ function PortfolioSection({
   trades,
   balance,
   setFeedback,
+  showToast,
   refresh,
 }: {
   positions: State["positions"];
   trades: State["trades"];
   balance: number;
   setFeedback: (s: string) => void;
+  showToast: (s: string) => void;
   refresh: () => void;
 }) {
+  // While the chart is being scrubbed, the big price readout shows
+  // the scrubbed candle in place; on release it restores to live.
+  const [scrubCandle, setScrubCandle] = useState<Candle | null>(null);
   const [side, setSide] = useState<"buy" | "sell">("buy");
   const [coinPick, setCoinPick] = useState<number>(50);
   const [customCoins, setCustomCoins] = useState("");
@@ -3112,8 +3284,14 @@ function PortfolioSection({
   const buyMut = useMutation({
     mutationFn: (coins: number) => api.buyBtcWithCoins({ coins }),
     onSuccess: (r) => {
-      setFeedback(r.message);
-      if (r.ok) setCustomCoins("");
+      // Success confirms with a spring-in toast (Details.so pattern);
+      // failures stay on the persistent feedback line, never a toast.
+      if (r.ok) {
+        showToast(r.message);
+        setCustomCoins("");
+      } else {
+        setFeedback(r.message);
+      }
       refresh();
     },
     onError: () => setFeedback("Buy didn't go through — no coins were spent. Try again."),
@@ -3121,8 +3299,12 @@ function PortfolioSection({
   const sellMut = useMutation({
     mutationFn: (args: { coins?: number; closeAll: boolean }) => api.sellBtcForCoins(args),
     onSuccess: (r) => {
-      setFeedback(r.message);
-      if (r.ok) setCustomCoins("");
+      if (r.ok) {
+        showToast(r.message);
+        setCustomCoins("");
+      } else {
+        setFeedback(r.message);
+      }
       refresh();
     },
     onError: () => setFeedback("Sell didn't go through — your position is unchanged. Try again."),
@@ -3163,11 +3345,11 @@ function PortfolioSection({
 
   return (
     <section>
-      <SectionTitle right="BTC/USD only · coins are the money">
-        Trading room
+      <SectionTitle right="BTC/USD only · live from Coinbase">
+        Chart
       </SectionTitle>
 
-      <div className="mb-4 overflow-hidden rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 elev">
+      <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 elev">
         <div className="flex items-center gap-2">
           <p className="font-display text-base font-black">BTC · Crypto</p>
           <span className="mono rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] font-bold tracking-wide text-[var(--accent-ink)] uppercase">sole market</span>
@@ -3176,28 +3358,30 @@ function PortfolioSection({
             <span className="mono text-[10px] font-bold tracking-widest text-[var(--accent)] uppercase">Live</span>
           </span>
         </div>
-        <p className="mono mt-2 text-[46px] leading-none font-bold tracking-tight">
-          {livePrice ? `$${fmtPrice(livePrice)}` : "—"}
+        <p className="mono mt-2 text-[46px] leading-none font-bold tracking-tight" aria-live="off">
+          {scrubCandle ? `$${fmtPrice(scrubCandle.close)}` : livePrice ? `$${fmtPrice(livePrice)}` : "—"}
         </p>
         <p className="mono mt-1.5 text-sm font-semibold" style={{ color: chg != null && chg < 0 ? "var(--red)" : "var(--accent)" }}>
-          {chg != null ? `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}% · ${range}` : "—"}
-          <span className="ml-2 text-[11px] font-normal text-[var(--dim)]">Coinbase · free public API</span>
+          {scrubCandle ? (
+            <>Scrubbing · {fmtDetroitTime(scrubCandle.t)} ET</>
+          ) : (
+            <>
+              {chg != null ? `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}% · ${range}` : "—"}
+              <span className="ml-2 text-[11px] font-normal text-[var(--dim)]">Coinbase · free public API</span>
+            </>
+          )}
         </p>
 
-        {/* Chart-type switch */}
-        <div className="mt-3 flex items-center gap-1 rounded-full bg-[var(--surface2)] p-1" role="group" aria-label="Chart type">
-          {([["candles", "Candles"], ["line", "Line"], ["heikin", "Heikin-Ashi"]] as Array<[ChartType, string]>).map(([t, label]) => (
-            <button
-              key={t}
-              type="button"
-              aria-pressed={chartType === t}
-              onClick={() => setChartType(t)}
-              className="flex-1 rounded-full py-2 text-[13px] font-black"
-              style={chartType === t ? { background: "var(--accent)", color: "var(--accent-ink)" } : { color: "var(--dim)" }}
-            >
-              {label}
-            </button>
-          ))}
+        {/* Chart-type switch — sliding pill (Bencho) */}
+        <div className="mt-3">
+          <SlidingSegmented<ChartType>
+            options={[["candles", "Candles"], ["line", "Line"], ["heikin", "Heikin-Ashi"]]}
+            value={chartType}
+            onChange={setChartType}
+            ariaLabel="Chart type"
+            pillFor={() => "var(--accent)"}
+            textFor={() => "var(--accent-ink)"}
+          />
         </div>
         {/* Indicator toggles — exactly 3, all from the real candles */}
         <div className="mt-2 flex items-center gap-1.5" role="group" aria-label="Chart indicators">
@@ -3208,12 +3392,12 @@ function PortfolioSection({
             ["MACD", showMacd, setShowMacd],
           ] as Array<[string, boolean, (v: boolean) => void]>).map(([label, on, set]) => (
             <button
-              key={label}
+              key={`${label}-${on}`}
               type="button"
               aria-pressed={on}
               aria-label={`Toggle ${label} indicator`}
               onClick={() => set(!on)}
-              className="rounded-full px-3 py-1.5 text-xs font-bold"
+              className={`rounded-full px-3 py-1.5 text-xs font-bold ${on ? "chip-pop" : ""}`}
               style={on ? { background: "var(--surface3)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--accent)" } : { background: "var(--surface2)", color: "var(--faint)", boxShadow: "inset 0 0 0 1px var(--border)" }}
             >
               {label}
@@ -3223,34 +3407,38 @@ function PortfolioSection({
 
         <div className="mt-3">
           {candles.length >= 2 ? (
-            <MarketChart candles={candles} chartType={chartType} showEma={showEma} showRsi={showRsi} showMacd={showMacd} />
+            <MarketChart candles={candles} chartType={chartType} showEma={showEma} showRsi={showRsi} showMacd={showMacd} onScrub={setScrubCandle} />
+          ) : candlesQ.isPending ? (
+            <div role="status" aria-label="Loading real BTC candles from Coinbase">
+              <div className="skeleton h-[190px] rounded-2xl" />
+              <div className="mt-2 flex gap-2">
+                <div className="skeleton h-[54px] flex-1 rounded-2xl" />
+                <div className="skeleton h-[54px] flex-1 rounded-2xl" />
+              </div>
+            </div>
           ) : (
             <p className="rounded-2xl bg-[var(--surface2)] px-4 py-6 text-center text-sm text-[var(--dim)]">
-              {candlesQ.isPending
-                ? "Loading real BTC candles from Coinbase…"
-                : `${candlesQ.data?.message ?? "Chart unavailable."} Showing your stored price above.`}
+              {`${candlesQ.data?.message ?? "Chart unavailable."} Showing your stored price above.`}
             </p>
           )}
         </div>
-        <div className="mt-3 flex items-center gap-1 rounded-full bg-[var(--surface2)] p-1" role="group" aria-label="Chart range">
-          <span className="flex items-center gap-1.5 px-2.5 text-xs font-bold text-[var(--dim)]">
+        <div className="mt-3 flex items-center gap-2">
+          <span className="flex shrink-0 items-center gap-1.5 px-1 text-xs font-bold text-[var(--dim)]">
             <span className="live-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" aria-hidden /> Live
           </span>
-          {(["24H", "7D", "1M"] as CandleRange[]).map((r) => (
-            <button
-              key={r}
-              type="button"
-              aria-pressed={range === r}
-              onClick={() => setRange(r)}
-              className="flex-1 rounded-full py-2 text-sm font-black"
-              style={range === r ? { background: "var(--accent)", color: "var(--accent-ink)" } : { color: "var(--dim)" }}
-            >
-              {r}
-            </button>
-          ))}
+          <div className="min-w-0 flex-1">
+            <SlidingSegmented<CandleRange>
+              options={[["24H", "24H"], ["7D", "7D"], ["1M", "1M"]]}
+              value={range}
+              onChange={setRange}
+              ariaLabel="Chart range"
+              pillFor={() => "var(--accent)"}
+              textFor={() => "var(--accent-ink)"}
+            />
+          </div>
           <button
             type="button"
-            className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-[var(--dim)] disabled:opacity-40"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-[var(--surface2)] text-[var(--dim)] disabled:opacity-40"
             disabled={livePriceMut.isPending}
             onClick={() => { livePriceMut.mutate(); candlesQ.refetch(); }}
             aria-label="Refresh live BTC price and chart"
@@ -3281,9 +3469,13 @@ function PortfolioSection({
           </button>
         </div>
 
-        {/* Position card — IN COINS (the only position display) */}
+      </div>
+
+      {/* Position card — IN COINS (the only position display) */}
+      <div className="mt-5">
+        <SectionTitle right="counted in coins">Your position</SectionTitle>
         {btcPos ? (
-          <div className="purple-card mt-4 rounded-[var(--radius)] p-5">
+          <div className="purple-card rounded-[var(--radius)] p-5">
             <p className="font-display text-sm font-black tracking-wide">Your Position — in coins</p>
             <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-4">
               <div className="min-w-0">
@@ -3323,7 +3515,7 @@ function PortfolioSection({
             </div>
           </div>
         ) : (
-          <div className="mt-4 rounded-[var(--radius)] bg-[var(--surface2)] px-4 py-4">
+          <div className="rounded-[var(--radius)] bg-[var(--surface2)] px-4 py-4">
             <p className="font-display text-sm font-black">No BTC position yet — 0 coins in BTC</p>
             <p className="mt-1 text-sm text-[var(--dim)]">
               Your bankroll is {balance.toLocaleString()} free coins. Spend coins below to open
@@ -3334,6 +3526,9 @@ function PortfolioSection({
       </div>
 
       {/* Coin trade panel — spend coins to buy, sell back into coins */}
+      <div className="mt-5">
+        <SectionTitle right="one wallet for trades and duel wagers">Trade ticket</SectionTitle>
+      </div>
       <div id="trade-ticket" className={`elev scroll-mt-20 ${cardCls} p-4`}>
         <p className="font-display flex items-center gap-2 font-extrabold">
           <Icon name="bolt" size={18} className="text-[var(--accent)]" /> Trade with coins — BTC/USD
@@ -3343,23 +3538,16 @@ function PortfolioSection({
           wagers in Battle. Coins sitting in BTC aren't free to wager until
           you sell. Every trade feeds your duel score.
         </p>
-        <div className="mt-3 grid grid-cols-2 gap-1 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface2)] p-1" role="group" aria-label="Trade side">
-          <button
-            type="button"
-            aria-pressed={side === "buy"}
-            className={`rounded-[var(--radius)] py-2.5 font-display text-sm font-extrabold tracking-wide ${side === "buy" ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "text-[var(--dim)]"}`}
-            onClick={() => setSide("buy")}
-          >
-            BUY WITH COINS
-          </button>
-          <button
-            type="button"
-            aria-pressed={side === "sell"}
-            className={`rounded-[var(--radius)] py-2.5 font-display text-sm font-extrabold tracking-wide ${side === "sell" ? "bg-[var(--red)] text-white" : "text-[var(--dim)]"}`}
-            onClick={() => setSide("sell")}
-          >
-            SELL FOR COINS
-          </button>
+        <div className="mt-3">
+          <SlidingSegmented<"buy" | "sell">
+            options={[["buy", "BUY WITH COINS"], ["sell", "SELL FOR COINS"]]}
+            value={side}
+            onChange={setSide}
+            ariaLabel="Trade side"
+            pillFor={(v) => (v === "buy" ? "var(--accent)" : "var(--red)")}
+            textFor={(v) => (v === "buy" ? "var(--accent-ink)" : "#ffffff")}
+            rounded="rounded-[var(--radius)]"
+          />
         </div>
 
         <p className="mono mt-3 text-xs text-[var(--dim)]">
@@ -3368,20 +3556,23 @@ function PortfolioSection({
             : `Position value: ${Math.round(posValueCoins).toLocaleString()} coins — pick how many coins' worth to sell`}
         </p>
         <div className="mt-2 flex flex-wrap items-center gap-2" role="group" aria-label="Coin amount quick picks">
-          {chips.map((amt) => (
-            <button
-              key={amt}
-              type="button"
-              aria-pressed={customCoins.trim() === "" && coinPick === amt}
-              onClick={() => { setCoinPick(amt); setCustomCoins(""); }}
-              className="rounded-full px-4 py-2 font-display text-sm font-extrabold"
-              style={customCoins.trim() === "" && coinPick === amt
-                ? { background: "var(--accent)", color: "var(--accent-ink)" }
-                : { background: "var(--surface2)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--border)" }}
-            >
-              {amt}
-            </button>
-          ))}
+          {chips.map((amt) => {
+            const selected = customCoins.trim() === "" && coinPick === amt;
+            return (
+              <button
+                key={`${amt}-${selected}`}
+                type="button"
+                aria-pressed={selected}
+                onClick={() => { setCoinPick(amt); setCustomCoins(""); }}
+                className={`rounded-full px-4 py-2 font-display text-sm font-extrabold ${selected ? "chip-pop" : ""}`}
+                style={selected
+                  ? { background: "var(--accent)", color: "var(--accent-ink)" }
+                  : { background: "var(--surface2)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--border)" }}
+              >
+                {amt}
+              </button>
+            );
+          })}
           <button
             type="button"
             aria-label={side === "buy" ? "Max: spend all free coins" : "Max: sell the whole position value"}
@@ -3473,6 +3664,7 @@ function DuelsSection({
   duels,
   balance,
   setFeedback,
+  showToast,
   refresh,
   challengeReq,
   wagerReq,
@@ -3480,6 +3672,7 @@ function DuelsSection({
   duels: State["duels"];
   balance: number;
   setFeedback: (s: string) => void;
+  showToast: (s: string) => void;
   refresh: () => void;
   challengeReq: { name: string; nonce: number } | null;
   wagerReq: { wager: number; nonce: number } | null;
@@ -3507,8 +3700,12 @@ function DuelsSection({
         durationLabel: duration,
       }),
     onSuccess: (r) => {
-      setFeedback(r.message);
-      if (r.ok) setOpponent("");
+      if (r.ok) {
+        showToast(r.message);
+        setOpponent("");
+      } else {
+        setFeedback(r.message);
+      }
       refresh();
     },
     onError: () => setFeedback("That didn't go through — try again."),
@@ -3569,9 +3766,9 @@ function DuelsSection({
   const potPreview = Number.isFinite(wagerNum) && wagerNum > 0 ? wagerNum * 2 : 0;
 
   return (
-    <section className="mt-8">
-      <SectionTitle right="winner takes the pot">
-        Duel rooms
+    <section className="mt-5">
+      <SectionTitle right="create a room, manage your duels">
+        My duels
       </SectionTitle>
 
       <form
@@ -3620,22 +3817,25 @@ function DuelsSection({
         <div className="mt-3">
           <span className={labelCls} id="wager-label">Wager (coins)</span>
           <div className="flex flex-wrap items-center gap-2" role="group" aria-labelledby="wager-label">
-            {[50, 100, 250].map((amt) => (
-              <button
-                key={amt}
-                type="button"
-                aria-pressed={wager === String(amt)}
-                onClick={() => setWager(String(amt))}
-                className="rounded-full px-4 py-2 font-display text-sm font-extrabold"
-                style={
-                  wager === String(amt)
-                    ? { background: "var(--accent)", color: "var(--accent-ink)" }
-                    : { background: "var(--surface2)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--border)" }
-                }
-              >
-                {amt}
-              </button>
-            ))}
+            {[50, 100, 250].map((amt) => {
+              const selected = wager === String(amt);
+              return (
+                <button
+                  key={`${amt}-${selected}`}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => setWager(String(amt))}
+                  className={`rounded-full px-4 py-2 font-display text-sm font-extrabold ${selected ? "chip-pop" : ""}`}
+                  style={
+                    selected
+                      ? { background: "var(--accent)", color: "var(--accent-ink)" }
+                      : { background: "var(--surface2)", color: "var(--text)", boxShadow: "inset 0 0 0 1px var(--border)" }
+                  }
+                >
+                  {amt}
+                </button>
+              );
+            })}
             <input
               id="duel-wager"
               aria-label="Wager in coins"
@@ -3675,8 +3875,25 @@ function DuelsSection({
               <div
                 key={d.id}
                 className={`${cardCls} relative overflow-hidden p-4`}
+                style={
+                  d.status === "completed"
+                    ? { borderColor: d.winner === "you" ? "var(--gold-deep)" : "rgba(255,82,82,0.45)" }
+                    : undefined
+                }
               >
-                <span aria-hidden className="absolute top-0 bottom-0 left-0 w-[6px] bg-[var(--accent)]" style={{ opacity: d.status === "void" ? 0.25 : 1 }} />
+                <span
+                  aria-hidden
+                  className="absolute top-0 bottom-0 left-0 w-[6px]"
+                  style={{
+                    background:
+                      d.status === "completed"
+                        ? d.winner === "you"
+                          ? "var(--gold)"
+                          : "var(--red)"
+                        : "var(--accent)",
+                    opacity: d.status === "void" ? 0.25 : 1,
+                  }}
+                />
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <p className="font-display font-bold">
                     You vs {d.opponent}
@@ -3700,14 +3917,16 @@ function DuelsSection({
                 </p>
                 {d.status === "completed" ? (
                   <p className="mono mt-1 text-sm">
-                    Final score {d.your_score} – {d.opp_score} ·{" "}
+                    Final score{" "}
+                    {d.your_score != null ? <ScoreCountUp value={d.your_score} /> : "—"} –{" "}
+                    {d.opp_score != null ? <ScoreCountUp value={d.opp_score} /> : "—"} ·{" "}
                     {d.winner === "you" ? (
-                      <span style={{ color: "var(--gold)" }}>
-                        you took the pot
+                      <span className="font-bold" style={{ color: "var(--gold)" }}>
+                        VICTORY — you took the pot
                       </span>
                     ) : (
-                      <span style={{ color: "var(--red)" }}>
-                        {d.opponent} took the pot
+                      <span className="font-bold" style={{ color: "var(--red)" }}>
+                        DEFEAT — {d.opponent} took the pot
                       </span>
                     )}
                   </p>
@@ -3793,7 +4012,8 @@ function DuelsSection({
                       className={`${primaryBtn} inline-flex items-center gap-1.5`}
                       onClick={() =>
                         api.autoCompleteDuel({ id: d.id }).then((r) => {
-                          setFeedback(r.message);
+                          if (r.ok) showToast(r.message);
+                          else setFeedback(r.message);
                           refresh();
                         })
                       }
@@ -3825,140 +4045,56 @@ function DuelsSection({
   );
 }
 
-// ---------- wallet: balance, adjust, full ledger ----------
+// ---------- wallet: the coin ledger (Profile) ----------
+// Ledger/history only: the balance itself lives in the app bar and
+// the Home hero, so it is not repeated here, and the owner-only
+// Adjust wallet form is not part of the player view (the action
+// stays available server-side).
 
 function WalletSection({
-  balance,
   txns,
-  setFeedback,
-  refresh,
 }: {
-  balance: number;
   txns: State["walletTxns"];
-  setFeedback: (s: string) => void;
-  refresh: () => void;
 }) {
-  const [adjAmount, setAdjAmount] = useState("");
-  const [adjLabel, setAdjLabel] = useState("");
-
-  const adjMut = useMutation({
-    mutationFn: () =>
-      api.adjustWallet({ amount: Number(adjAmount), label: adjLabel }),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      if (r.ok) {
-        setAdjAmount("");
-        setAdjLabel("");
-      }
-      refresh();
-    },
-    onError: () => setFeedback("That didn't go through — try again."),
-  });
-
-  const onAdjust = (e: FormEvent) => {
-    e.preventDefault();
-    const amt = Number(adjAmount);
-    if (!Number.isInteger(amt) || amt === 0 || !adjLabel.trim()) {
-      setFeedback("Enter a whole-coin amount (can be negative) and a label.");
-      return;
-    }
-    adjMut.mutate();
-  };
-
   return (
-    <section className="mt-8">
-      <SectionTitle num="02" right="integer coins · every move is a ledger row">Coin wallet</SectionTitle>
-      <div className="gold-wash elev rounded-[var(--radius)] border border-[var(--border-strong)] p-5">
-        <p className="mono flex items-center gap-1.5 text-[11px] font-bold tracking-[0.18em] text-[var(--dim)] uppercase">
-          <Icon name="coin" size={14} className="text-[var(--gold)]" /> Balance
+    <section className="mt-5">
+      <SectionTitle right="every coin move is a ledger row">Wallet history</SectionTitle>
+      <div className={`${cardCls} p-4`}>
+        <p className="font-display flex items-center gap-2 font-bold">
+          <Icon name="wallet" size={17} className="text-[var(--gold)]" /> Coin ledger
         </p>
-        <p className="mono font-display mt-1 text-[38px] leading-none font-black">
-          {balance.toLocaleString()} <span className="text-lg text-[var(--gold)]">coins</span>
-        </p>
-        <p className="mono mt-2 text-[11px] text-[var(--dim)]">
-          Coins have no cash value — they're the league's score-keeping currency.
-        </p>
-      </div>
-
-      <div className="mt-3 grid gap-3">
-        <form
-          onSubmit={onAdjust}
-          className={`${cardCls} p-4`}
-        >
-          <p className="font-display font-bold">Adjust wallet</p>
-          <div className="mt-3 grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="adj-amount" className={labelCls}>
-                Coins (+ / −)
-              </label>
-              <input
-                id="adj-amount"
-                inputMode="numeric"
-                className={inputCls}
-                placeholder="250"
-                value={adjAmount}
-                onChange={(e) => setAdjAmount(e.target.value)}
-              />
-            </div>
-            <div>
-              <label htmlFor="adj-label" className={labelCls}>
-                Reason
-              </label>
-              <input
-                id="adj-label"
-                className={inputCls}
-                placeholder="Daily reward"
-                value={adjLabel}
-                onChange={(e) => setAdjLabel(e.target.value)}
-              />
-            </div>
-          </div>
-          <button
-            type="submit"
-            className={`${ghostBtn} mt-3`}
-            disabled={adjMut.isPending}
-          >
-            Apply adjustment
-          </button>
-        </form>
-
-        <div className={`${cardCls} p-4`}>
-          <p className="font-display flex items-center gap-2 font-bold">
-            <Icon name="wallet" size={17} className="text-[var(--gold)]" /> Wallet history
+        {txns.length === 0 ? (
+          <p className="mt-2 text-sm text-[var(--dim)]">
+            No transactions yet.
           </p>
-          {txns.length === 0 ? (
-            <p className="mt-2 text-sm text-[var(--dim)]">
-              No transactions yet.
-            </p>
-          ) : (
-            <div className="mt-2 space-y-1.5">
-              {txns.slice(0, 12).map((t) => (
-                <div
-                  key={t.id}
-                  className="flex items-baseline justify-between gap-2"
-                >
-                  <span className="min-w-0 flex-1 break-words text-sm">{t.label}</span>
-                  <span className="mono shrink-0 text-[11px] text-[var(--faint)]">{fmtDate(t.created_at)}</span>
-                  {t.amount === 0 ? (
-                    <span className="mono shrink-0 text-xs font-semibold text-[var(--dim)]">
-                      bot side
-                    </span>
-                  ) : (
-                    <span
-                      className="mono shrink-0 text-sm font-semibold"
-                      style={{
-                        color: t.amount >= 0 ? "var(--gain)" : "var(--loss)",
-                      }}
-                    >
-                      {t.amount >= 0 ? "+" : ""}
-                      {t.amount}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        ) : (
+          <div className="mt-2 space-y-1.5">
+            {txns.slice(0, 12).map((t) => (
+              <div
+                key={t.id}
+                className="flex items-baseline justify-between gap-2"
+              >
+                <span className="min-w-0 flex-1 break-words text-sm">{t.label}</span>
+                <span className="mono shrink-0 text-[11px] text-[var(--faint)]">{fmtDate(t.created_at)}</span>
+                {t.amount === 0 ? (
+                  <span className="mono shrink-0 text-xs font-semibold text-[var(--dim)]">
+                    bot side
+                  </span>
+                ) : (
+                  <span
+                    className="mono shrink-0 text-sm font-semibold"
+                    style={{
+                      color: t.amount >= 0 ? "var(--gain)" : "var(--loss)",
+                    }}
+                  >
+                    {t.amount >= 0 ? "+" : ""}
+                    {t.amount}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </section>
   );
@@ -4085,553 +4221,3 @@ function PlayerCard({
   );
 }
 
-// ---------- ML signals ----------
-
-function SignalsSection({
-  signals,
-  setFeedback,
-  refresh,
-}: {
-  signals: State["signals"];
-  setFeedback: (s: string) => void;
-  refresh: () => void;
-}) {
-  // Signals are BTC/USD only in this edition (server enforces it too);
-  // prototype signals for other symbols stay on the board as legacy.
-  const symbol = "BTC";
-  const [signal, setSignal] = useState<
-    "STRONG BUY" | "BUY" | "HOLD" | "SELL" | "STRONG SELL"
-  >("BUY");
-  const [confidence, setConfidence] = useState(70);
-  const [note, setNote] = useState("");
-
-  const addMut = useMutation({
-    mutationFn: () =>
-      api.addSignal({ symbol, signal, confidence, note }),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      setNote("");
-      refresh();
-    },
-  });
-  const deleteMut = useMutation({
-    mutationFn: (id: number) => api.deleteSignal({ id }),
-    onSuccess: (r) => {
-      setFeedback(r.message);
-      refresh();
-    },
-  });
-
-  const onAdd = (e: FormEvent) => {
-    e.preventDefault();
-    addMut.mutate();
-  };
-
-  const color = (s: string) =>
-    s.includes("BUY")
-      ? "var(--gain)"
-      : s.includes("SELL")
-        ? "var(--loss)"
-        : "var(--dim)";
-
-  return (
-    <section className="mt-8">
-      <SectionTitle num="03" right="VisualML · BTC/USD only">Signal board</SectionTitle>
-      {signals.length === 0 ? (
-        <p className={`${cardCls} p-4 text-sm text-[var(--dim)]`}>
-          No signals on the board. Add one below.
-        </p>
-      ) : (
-        <div className="space-y-2">
-          {signals.map((s) => (
-            <div
-              key={s.id}
-              className={`flex items-center gap-3 ${cardCls} px-4 py-3`}
-            >
-              <span className="mono w-20 font-semibold">
-                {s.symbol.toUpperCase() === "BTC" ? "BTC/USD" : s.symbol}
-                {s.symbol.toUpperCase() !== "BTC" ? (
-                  <span className="block text-[10px] font-normal text-[var(--faint)]">legacy</span>
-                ) : null}
-              </span>
-              <span
-                className="mono w-28 text-sm font-semibold"
-                style={{ color: color(s.signal) }}
-              >
-                {s.signal}
-              </span>
-              <div className="h-3 flex-1 overflow-hidden rounded-sm bg-[var(--surface2)]">
-                <div
-                  className="bar-anim h-full"
-                  style={{
-                    width: `${s.confidence}%`,
-                    background: color(s.signal),
-                  }}
-                />
-              </div>
-              <span className="mono w-10 text-right text-sm">
-                {s.confidence}%
-              </span>
-              <button
-                type="button"
-                aria-label={`Remove ${s.symbol} signal`}
-                className="px-1 text-[var(--dim)]"
-                onClick={() => deleteMut.mutate(s.id)}
-              >
-                <Icon name="x" size={15} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-      <form
-        onSubmit={onAdd}
-        className={`mt-4 ${cardCls} p-4`}
-      >
-        <p className="font-display font-bold">Call a signal — BTC/USD</p>
-        <p className="mono mt-1 text-xs text-[var(--dim)]">
-          New signals are BTC/USD only in this edition. Older signals for other symbols remain on the board above, marked legacy.
-        </p>
-        <div className="mt-3 grid grid-cols-2 gap-3">
-          <div>
-            <span className={labelCls} id="signal-pair-label">Pair</span>
-            <div
-              role="img"
-              aria-labelledby="signal-pair-label"
-              aria-label="Pair: BTC/USD — the only pair for new signals in this edition"
-              className="flex items-center gap-2 rounded-[var(--radius)] border border-[var(--border-strong)] bg-[var(--surface2)] px-3 py-2.5"
-            >
-              <Icon name="bitcoin" size={18} className="shrink-0 text-[var(--gold)]" />
-              <span className="font-display text-sm font-extrabold">BTC/USD</span>
-              <span className="mono ml-auto text-[10px] font-bold tracking-wide text-[var(--accent)] uppercase">only pair</span>
-            </div>
-          </div>
-          <div>
-            <label htmlFor="signal-type" className={labelCls}>
-              Signal
-            </label>
-            <select
-              id="signal-type"
-              className={inputCls}
-              value={signal}
-              onChange={(e) =>
-                setSignal(
-                  e.target.value as
-                    | "STRONG BUY"
-                    | "BUY"
-                    | "HOLD"
-                    | "SELL"
-                    | "STRONG SELL",
-                )
-              }
-            >
-              <option>STRONG BUY</option>
-              <option>BUY</option>
-              <option>HOLD</option>
-              <option>SELL</option>
-              <option>STRONG SELL</option>
-            </select>
-          </div>
-          <div>
-            <label htmlFor="signal-confidence" className={labelCls}>
-              Confidence: {confidence}%
-            </label>
-            <input
-              id="signal-confidence"
-              type="range"
-              min={0}
-              max={100}
-              value={confidence}
-              onChange={(e) => setConfidence(Number(e.target.value))}
-              className="mt-2 w-full accent-[var(--accent)]"
-            />
-          </div>
-          <div>
-            <label htmlFor="signal-note" className={labelCls}>
-              Note (optional)
-            </label>
-            <input
-              id="signal-note"
-              className={inputCls}
-              placeholder="Breakout setup"
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-            />
-          </div>
-        </div>
-        <button
-          type="submit"
-          className={`${primaryBtn} mt-3`}
-          disabled={addMut.isPending}
-        >
-          Post signal
-        </button>
-      </form>
-    </section>
-  );
-}
-
-// ---------- every screen in the game ----------
-
-function PhoneMock({ title, status, children }: { title: string; status: string; children: ReactNode }) {
-  return (
-    <div className="w-[240px] shrink-0 snap-center">
-      <div className="mx-auto w-full max-w-[230px] rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] p-2">
-        <div className="rounded-[20px] bg-[var(--surface2)] px-3 pt-2 pb-3">
-          <div className="mx-auto mb-2 h-1.5 w-10 rounded-full bg-[var(--border)]" />
-          {children}
-        </div>
-      </div>
-      <p className="mt-2 text-center font-display text-sm font-bold">{title}</p>
-      <p className="text-center text-xs text-[var(--dim)]">{status}</p>
-    </div>
-  );
-}
-
-const mockBar = (w: string, c = "var(--accent)") => <div className="h-2 rounded-full" style={{ width: w, background: c }} />;
-const mockLine = (w: string) => <div className="h-2 rounded bg-[var(--border)]" style={{ width: w }} />;
-
-function ScreensGallery() {
-  return (
-    <section className="mt-8">
-      <SectionTitle num="04" right="the full game, screen by screen">Every screen in the game</SectionTitle>
-      <p className="mb-4 text-sm text-[var(--dim)]">This is the complete screen map for the Paper Trading League, built out to the deploy line and stopping there. In this app the live screens ARE the tabs — League HQ, Battle, Trading Room, Standings, Profile — and this gallery is the designed look of each one, starting with the welcome and sign-in flow that opens the game. Swipe sideways through the phones. Nothing deploys until you say deploy.</p>
-      <div className="flex snap-x snap-mandatory gap-4 overflow-x-auto pb-2">
-        <PhoneMock title="1 · Splash & sign-in" status="Live — the welcome, sign-in and player-card setup are this edition's first screens; Google sign-in itself ships with the mobile build">
-          <span className="flex justify-center"><Icon name="swords" size={30} className="text-[var(--accent)]" /></span>
-          <p className="font-display mt-1 text-center text-sm font-black">PAPER TRADING LEAGUE</p>
-          <p className="mono text-center text-[10px] text-[var(--dim)]">DUEL · TRADE BTC/USD · WIN COINS</p>
-          <div className="mt-3 space-y-1.5">{mockLine("100%")}{mockLine("70%")}</div>
-          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Sign in with Google</div>
-          <p className="mono mt-2 text-center text-[10px] text-[var(--dim)]">+500 starter coins</p>
-        </PhoneMock>
-        <PhoneMock title="2 · League HQ" status="Live — the Home tab: season banner, player card, featured rooms, quests">
-          <div className="rounded-[var(--radius)] bg-[var(--surface)] p-2">
-            <p className="mono text-[9px] font-bold text-[var(--accent)]">SEASON 1 · LIVE</p>
-            <p className="font-display text-xs font-black">Friday-night arena</p>
-          </div>
-          <div className="mt-2 flex items-center justify-between"><span className="font-display text-xs font-bold">Kass · Lv 1</span><span className="mono text-[10px]">500 coins</span></div>
-          <div className="mt-2">{mockBar("45%")}</div>
-          <div className="mt-3 grid grid-cols-2 gap-1.5">
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5 text-center text-xs">Nova's Room</div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5 text-center text-xs">BearTrap's Room</div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5 text-center text-xs">KasKing's Room</div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5 text-center text-xs">SteadyEddie's</div>
-          </div>
-          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Enter a duel</div>
-        </PhoneMock>
-        <PhoneMock title="3 · Open a room" status="Live — Battle tab: rules card, wager escrows on create, bot matches on accept">
-          <p className="font-display text-xs font-bold">CHALLENGE NOVA · BTC/USD</p>
-          <div className="mt-2 space-y-1.5">{mockLine("80%")}{mockLine("60%")}</div>
-          <div className="mt-2 flex gap-1.5">
-            <span className="rounded-full bg-[var(--surface)] px-2 py-1 text-[10px] font-bold">50 coins</span>
-            <span className="rounded-full bg-[var(--accent)] px-2 py-1 text-[10px] font-bold text-[var(--accent-ink)]">100 coins</span>
-            <span className="rounded-full bg-[var(--surface)] px-2 py-1 text-[10px] font-bold">250 coins</span>
-          </div>
-          <div className="mt-2 flex gap-1.5">
-            <span className="rounded-full bg-[var(--accent)] px-2 py-1 text-[10px] font-bold text-[var(--accent-ink)]">30 min</span>
-            <span className="rounded-full bg-[var(--surface)] px-2 py-1 text-[10px] font-bold">4 hours</span>
-            <span className="rounded-full bg-[var(--surface)] px-2 py-1 text-[10px] font-bold">24 hours</span>
-          </div>
-          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Escrow &amp; open room</div>
-        </PhoneMock>
-        <PhoneMock title="4 · Live room" status="Live — the Battle tab VS screen: score build-up, both escrows, pot">
-          <div className="flex items-center justify-between text-center">
-            <div><p className="font-display text-xs font-extrabold">K</p><p className="mono text-[10px] font-bold">YOU 62.4</p></div>
-            <p className="font-display text-sm font-black">VS</p>
-            <div><p className="font-display text-xs font-extrabold">NV</p><p className="mono text-[10px] font-bold">NOVA ?</p></div>
-          </div>
-          <div className="mt-2 space-y-1.5">{mockBar("62%")}{mockBar("48%", "var(--text)")}</div>
-          <p className="mono mt-2 text-center text-[10px]">Pot 200 coins · 30 min · BTC/USD</p>
-          <div className="mt-2 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Auto-score finish</div>
-        </PhoneMock>
-        <PhoneMock title="5 · Trading room" status="Live — the Trade tab: live Coinbase BTC/USD price, coin trading, position in coins">
-          <p className="font-display text-xs font-bold">BTC/USD · LIVE $76,000</p>
-          <div className="mt-2 flex gap-1.5">
-            <span className="flex-1 rounded-full bg-[var(--accent)] py-1 text-center text-[10px] font-bold text-[var(--accent-ink)]">BUY WITH COINS</span>
-            <span className="flex-1 rounded-full bg-[var(--surface)] py-1 text-center text-[10px] font-bold">SELL</span>
-          </div>
-          <div className="mt-2 space-y-1.5">{mockLine("100%")}{mockLine("100%")}{mockLine("55%")}</div>
-          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Buy — spend 50 coins</div>
-          <p className="mono mt-2 text-center text-[10px] text-[var(--dim)]">Counts toward your duel score</p>
-        </PhoneMock>
-        <PhoneMock title="6 · Season charts" status="Live — League tab charts: bankroll mix in coins, balance line, duel record">
-          <p className="mono text-[10px]">YOUR BANKROLL</p>
-          <p className="font-display text-base font-extrabold">500 coins</p>
-          <div className="mt-2 flex h-3 overflow-hidden rounded-full"><div className="bg-[var(--accent)]" style={{ width: "65%" }} /><div className="bg-[var(--text)]" style={{ width: "26%" }} /><div style={{ width: "9%", background: "var(--gold)" }} /></div>
-          <div className="mt-2 space-y-1">{mockLine("90%")}{mockLine("75%")}{mockLine("60%")}</div>
-          <svg viewBox="0 0 100 24" className="mt-2 w-full" style={{ height: 28 }} aria-hidden><polyline points="0,20 25,16 50,17 75,8 100,5" fill="none" stroke="var(--accent)" strokeWidth="2" /></svg>
-        </PhoneMock>
-        <PhoneMock title="7 · Score reveal" status="Live — shown on every Battle finish; the score lab is on the League tab">
-          <span className="flex justify-center"><Icon name="trophy" size={26} className="text-[var(--gold)]" /></span>
-          <p className="font-display mt-1 text-center text-xs font-extrabold">VICTORY — +200 coins</p>
-          <div className="mt-2 space-y-1.5">
-            <div className="flex items-center gap-1"><span className="mono w-3 text-[10px] font-bold">R</span><div className="flex-1">{mockBar("80%")}</div></div>
-            <div className="flex items-center gap-1"><span className="mono w-3 text-[10px] font-bold">K</span><div className="flex-1">{mockBar("65%", "var(--text)")}</div></div>
-            <div className="flex items-center gap-1"><span className="mono w-3 text-[10px] font-bold">C</span><div className="flex-1">{mockBar("70%", "var(--gold)")}</div></div>
-            <div className="flex items-center gap-1"><span className="mono w-3 text-[10px] font-bold">A</span><div className="flex-1">{mockBar("50%", "var(--accent)")}</div></div>
-          </div>
-          <p className="mono mt-2 text-center text-[10px]">MMR 1000 → 1025 (+25)</p>
-        </PhoneMock>
-        <PhoneMock title="8 · Standings" status="Live — the League tab: podium, your live row vs the bot league, head-to-head">
-          <div className="space-y-1.5">
-            {["1 · Nova · 1240", "2 · BearTrap · 1185", "3 · KasKing · 1090", "4 · You · 1000", "5 · PixelPete · 960"].map((t, i) => (
-              <div key={t} className={`rounded-[var(--radius)] px-2 py-1 text-[11px] font-semibold ${i === 3 ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "bg-[var(--surface)]"}`}>{t}</div>
-            ))}
-          </div>
-          <p className="mono mt-2 text-center text-[10px] text-[var(--dim)]">Weekly pool $2,450 · resets Monday</p>
-        </PhoneMock>
-        <PhoneMock title="9 · Coin wallet" status="Live — Profile tab: gold balance card + full ledger history">
-          <p className="mono text-[10px]">COIN WALLET</p>
-          <p className="font-display text-base font-extrabold">500 coins</p>
-          <div className="mt-2 space-y-1.5">
-            <div className="flex justify-between text-[11px]"><span>Starter grant</span><span className="mono font-bold">+500</span></div>
-            <div className="flex justify-between text-[11px]"><span>Duel entry vs Nova</span><span className="mono font-bold">−100</span></div>
-            <div className="flex justify-between text-[11px]"><span>Duel win — pot</span><span className="mono font-bold">+200</span></div>
-          </div>
-          <div className="mt-3 rounded-full bg-[var(--surface)] py-1.5 text-center text-xs font-bold">Every move is a ledger row</div>
-        </PhoneMock>
-        <PhoneMock title="10 · Player card" status="Live — the Profile tab: identity, tier, trophy shelf, badges, build plan">
-          <div className="flex items-center gap-2"><span className="font-display grid h-9 w-9 place-items-center rounded-full bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" aria-hidden>K</span><div>{mockLine("70%")}<p className="mono mt-1 text-[10px]">MMR 1000 · 0W–0L</p></div></div>
-          <div className="mt-3 grid grid-cols-3 gap-1 text-center">
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">500</p><p className="text-[9px]">coins</p></div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">Lv 1</p><p className="text-[9px]">level</p></div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1"><p className="mono text-[10px] font-bold">BTC</p><p className="text-[9px]">market</p></div>
-          </div>
-          <div className="mt-2 flex justify-center gap-2 text-[var(--gold)]"><Icon name="trophy" size={16} /><Icon name="medal" size={16} /><Icon name="lock" size={16} /></div>
-        </PhoneMock>
-        <PhoneMock title="11 · Tournaments" status="Live — the Battle tab's 24/7 cups board; entries play out as duel rooms in this edition">
-          <p className="font-display text-xs font-bold">TOURNAMENTS · 24/7</p>
-          <div className="mt-2 space-y-1.5">
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5"><p className="text-[11px] font-bold">Rookie Rumble</p><p className="mono text-[9px] text-[var(--dim)]">POOL 500 · ENTRY 50</p></div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5"><p className="text-[11px] font-bold">BTC/USD Cup</p><p className="mono text-[9px] text-[var(--dim)]">POOL 1,000 · ENTRY 100</p></div>
-            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-1.5"><p className="text-[11px] font-bold">High Roller Open</p><p className="mono text-[9px] text-[var(--dim)]">POOL 2,500 · ENTRY 250</p></div>
-          </div>
-          <div className="mt-3 rounded-full bg-[var(--accent)] py-1.5 text-center text-xs font-bold text-[var(--accent-ink)]">Enter cup</div>
-        </PhoneMock>
-      </div>
-    </section>
-  );
-}
-
-// ---------- build plan ----------
-
-function BuildPlanSection({
-  milestones,
-  refresh,
-}: {
-  milestones: State["milestones"];
-  refresh: () => void;
-}) {
-  const toggleMut = useMutation({
-    mutationFn: (args: { id: number; done: boolean }) =>
-      api.toggleMilestone(args),
-    onSuccess: () => refresh(),
-  });
-
-  if (milestones.length === 0) return null;
-
-  return (
-    <section className="mt-8">
-      <SectionTitle right="verified status shown per week">
-        8-week build order
-      </SectionTitle>
-      <p className="mb-3 text-sm text-[var(--dim)]">
-        The badge on each week is what's actually built and verified in this app — the same
-        status the Home build chip and the deploy-line screen show. The checkbox is your own
-        tracker; the badge is the verified state, and deploy steps are never badged ready.
-      </p>
-      <div className={`overflow-hidden ${cardCls}`} style={{ borderRadius: "var(--radius)" }}>
-        {milestones.map((m, i) => {
-          const tone = statusTone(m.status);
-          return (
-            <label
-              key={m.id}
-              className={`flex cursor-pointer items-start gap-3 bg-[var(--surface)] px-4 py-3 ${i > 0 ? "border-t border-[var(--border)]" : ""}`}
-            >
-              <input
-                type="checkbox"
-                checked={m.done}
-                onChange={(e) =>
-                  toggleMut.mutate({ id: m.id, done: e.target.checked })
-                }
-                className="mt-0.5 h-5 w-5 shrink-0 accent-[var(--accent)]"
-                aria-label={`Week ${m.week}: ${m.label}`}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="flex flex-wrap items-center gap-2">
-                  <span
-                    className={`font-display font-bold ${m.done ? "text-[var(--dim)] line-through" : ""}`}
-                  >
-                    Week {m.week} — {m.label}
-                  </span>
-                  <span
-                    className="mono rounded-full px-2 py-0.5 text-[10px] font-bold uppercase"
-                    style={{
-                      background:
-                        tone === "ready"
-                          ? "var(--accent)"
-                          : tone === "partial"
-                            ? "var(--text)"
-                            : "var(--surface2)",
-                      color: tone === "deploy" ? "var(--dim)" : "black",
-                    }}
-                  >
-                    {statusPill(m.status)}
-                  </span>
-                </span>
-                <span className="block text-sm text-[var(--dim)]">
-                  {m.detail}
-                </span>
-                {m.status_note ? (
-                  <span className="mt-0.5 block text-xs text-[var(--dim)]">{m.status_note}</span>
-                ) : null}
-              </span>
-            </label>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-// ---------- week 8: the deploy line ----------
-
-function DeployLineSection({
-  milestones,
-}: {
-  milestones: State["milestones"];
-}) {
-  const appReadyCount = milestones.filter(
-    (m) => m.status === "ready" || m.status === "app-scope",
-  ).length;
-  const waiting: string[] = [
-    "Nothing on prices — live BTC/USD quotes run on the free Coinbase public API (no key, no cost), so the blueprint's paid Polygon.io feed is no longer required",
-    "The literal mobile app (Expo) + API (NestJS/Supabase) — separate repos in the blueprint's Next Move, outside this dashboard edition",
-    "TestFlight beta (Week 7) and store submission (Week 8) — these ARE the deploy step: developer accounts, EAS submit, store listings",
-  ];
-  return (
-    <section className="mt-8">
-      <SectionTitle right="week 8 · built to the line, not past it">
-        The deploy line
-      </SectionTitle>
-      <div className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4">
-        <p className="font-display flex items-center gap-2 text-xl font-extrabold"><Icon name="shield" size={22} className="text-[var(--accent)]" /> Stopped at the deploy line</p>
-        <p className="mt-1 text-sm text-[var(--dim)]">
-          {appReadyCount} of the {milestones.length} weeks are built and verified in this
-          app; what remains is deploy itself. Nothing deploys, submits, or goes to a store
-          until Kass says deploy.
-        </p>
-        <div className={`mt-4 overflow-hidden ${cardCls}`} style={{ borderRadius: "var(--radius)" }}>
-          {milestones.map((m, i) => {
-            const tone = statusTone(m.status);
-            return (
-              <div
-                key={m.id}
-                className={`bg-[var(--surface2)] px-3.5 py-3 ${i > 0 ? "border-t border-[var(--border)]" : ""}`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <p className="font-display text-sm font-bold">
-                    Week {m.week} — {m.label}
-                  </p>
-                  <span
-                    className="mono shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase"
-                    style={{
-                      background:
-                        tone === "ready"
-                          ? "var(--accent)"
-                          : tone === "partial"
-                            ? "var(--text)"
-                            : "var(--surface)",
-                      color: tone === "deploy" ? "var(--dim)" : "black",
-                      border: tone === "deploy" ? "1px solid var(--border)" : undefined,
-                    }}
-                  >
-                    {statusPill(m.status)}
-                  </span>
-                </div>
-                {m.status_note ? (
-                  <p className="mt-1 text-xs text-[var(--dim)]">{m.status_note}</p>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-        <p className="mt-4 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">
-          <Icon name="clock" size={13} /> Waiting on deploy / keys
-        </p>
-        <ul className="mt-2 space-y-2">
-          {waiting.map((t) => (
-            <li key={t} className="flex gap-2 text-sm">
-              <Icon name="check" size={15} className="mt-0.5 shrink-0 text-[var(--text)]" />
-              <span>{t}</span>
-            </li>
-          ))}
-        </ul>
-        <p className="mono mt-4 rounded-[var(--radius)] bg-[var(--surface2)] px-3 py-2 text-xs">
-          When you're ready: say "deploy" and the next moves are (1) gasisit-api +
-          gasisit-mobile repos per the blueprint, (2) EAS/TestFlight, then store
-          submission — in that order, each verified as it lands. Prices need nothing:
-          the free Coinbase feed is already live.
-        </p>
-      </div>
-    </section>
-  );
-}
-
-// ---------- blueprint reference ----------
-
-function BlueprintSection() {
-  const rows: Array<[string, string]> = [
-    [
-      "Stack",
-      "Expo (React Native) + NestJS + Supabase Postgres + Redis/Socket.io · Market data: mock first, Polygon.io later",
-    ],
-    [
-      "Wallet rules",
-      "Coins are integers · every change is one atomic transaction with a ledger row · client_txn_id blocks double-spend on retries",
-    ],
-    [
-      "Anti-abuse (day 1)",
-      "24h rematch cooldown · shared-device check voids the duel · under 3 trades = void (50% pot burned, 50% refunded) · 5 duels/hr, 60 trades/hr rate limits",
-    ],
-    [
-      "Legal posture",
-      "No real money — coins have no cash value · educational trading simulator · age 17+ for the simulated-gambling descriptor · 0% rake until legal review",
-    ],
-    [
-      "Definition of MVP",
-      "A stranger downloads the app, signs up, duels a friend, and wins or loses coins with zero bugs. Everything else is V1.1.",
-    ],
-  ];
-  return (
-    <section className="mt-8">
-      <SectionTitle num="06" right="Production Blueprint V3">The blueprint</SectionTitle>
-      <div className={`overflow-hidden ${cardCls}`} style={{ borderRadius: "var(--radius)" }}>
-        {rows.map(([k, v], i) => (
-          <div
-            key={k}
-            className={`grid gap-1 bg-[var(--surface)] px-4 py-3 ${i > 0 ? "border-t border-[var(--border)]" : ""}`}
-          >
-            <p className="text-xs font-semibold tracking-wide text-[var(--dim)] uppercase">
-              {k}
-            </p>
-            <p className="text-sm">{v}</p>
-          </div>
-        ))}
-      </div>
-      <p className="mono mt-3 text-xs text-[var(--dim)]">
-        Source: G-Asisit Production Blueprint V3 + the Streamlit snapshot
-        (app.py) in your project files, and the Paper Trading League design in your Drive
-        (Mac Projects → Trading-League-Game). Prices refresh live from
-        the free Coinbase public API (BTC/USD spot — the only market in this edition; no key,
-        no account, no cost); the blueprint's named
-        provider, Polygon.io, is no longer required. Built to the deploy line and stopping
-        there: no store submission, no deployment, until you say deploy.
-        The remaining literal Week 7/8 work (Expo app, EAS/TestFlight,
-        store listings) lives in separate mobile/API repos outside this
-        dashboard.
-      </p>
-    </section>
-  );
-}
